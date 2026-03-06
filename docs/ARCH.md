@@ -203,10 +203,10 @@ Lambda 执行角色 (Account A)
 
 ### 3.3 前置条件
 
-- 副账号的 `ssh-guardian-target-role` 由用户手动创建，或通过独立 CDK stack / CloudFormation 模板部署
-- 该角色是 CDK 主部署的前置依赖，不在主 CDK app 中管理
+- 副账号的 `ssh-guardian-target-role` 通过 `scripts/setup.py` 自动创建
+- 该角色是 Chalice 部署的前置依赖，需先执行 setup 脚本
 
-### 3.4 部署时额外权限（仅初始化脚本使用，不给 Lambda 运行时）
+### 3.4 部署时额外权限（仅 setup.py 使用，不给 Lambda 运行时）
 
 ```
 ec2:CreateManagedPrefixList
@@ -274,87 +274,63 @@ Response: 401
 { "message": "Unauthorized" }
 ```
 
-## 5. 部署工具评估
+## 5. 部署架构
 
-| 维度 | CDK (Python) | SAM | Terraform |
-|------|-------------|-----|-----------|
-| 语言 | Python（与 Chalice Lambda 一致） | YAML 模板 + Python Lambda | HCL + Python Lambda |
-| 跨 Region 部署 | 原生支持（多 Stack 指定 env） | 需多次 deploy 指定 region | 原生支持（provider alias） |
-| Cognito 集成 | L2 Construct 完善 | 支持但配置冗长 | 支持 |
-| Prefix List 资源 | `CfnPrefixList` 可用 | CloudFormation 原生支持 | `aws_ec2_managed_prefix_list` |
-| 学习曲线 | 低（用户已倾向 CDK Python） | 中 | 中（需学 HCL） |
-| 与 Chalice 集成 | 可通过 CDK Stack 编排 Chalice 部署 | Chalice 独立部署 | Chalice 独立部署 |
+### 5.1 工具分工
 
-**结论：CDK Python。**
+| 工具 | 职责 |
+|------|------|
+| `chalice deploy` | 部署 Lambda + API Gateway + Cognito Authorizer + Lambda 执行角色（主账号部署 Region） |
+| `scripts/setup.py` | 基础设施初始化（boto3）：两个账号的 Prefix List 创建、SG 规则添加、副账号 IAM Role 创建 |
 
-理由：用户倾向 CDK Python；与 Lambda 代码同语言；Prefix List、IAM Role 均有成熟 Construct；Chalice 负责 Lambda + API Gateway 部署，CDK 负责 Prefix List 等基础设施。
+Chalice 原生支持 `CognitoUserPoolAuthorizer`，在 `app.py` 中声明即可，`chalice deploy` 自动配置 API Gateway Authorizer。不需要 CDK。
 
-## 6. 部署架构
+### 5.2 Chalice 部署
 
-### 6.1 CDK Stack 结构
-
-```
-cdk_app (仅部署到主账号 Account A)
-│
-├── MainStack (Account A / 部署 Region)
-│   ├── Chalice 应用部署（API Gateway + Lambda）
-│   ├── Lambda 执行角色（ec2:*PrefixList* + sts:AssumeRole）
-│   └── Cognito App Client 配置（引用已有 User Pool）
-│
-├── PrefixListStack-Region1 (Account A / Region 1)
-│   ├── Managed Prefix List (tag: ManagedBy=ssh-guardian)
-│   └── SG 入站规则初始化（按 target_tag 筛选 SG，添加 Prefix List 引用）
-│
-├── PrefixListStack-Region2 (Account A / Region 2)
-└── PrefixListStack-Region3 (Account A / Region 3)
-```
-
-共 1 个 MainStack + 3 个 PrefixListStack（主账号 3 个 Region）。
-
-副账号的 Prefix List 和 SG 规则通过独立脚本或 CDK app 部署（使用副账号凭证）。
-
-### 6.2 副账号前置条件（独立于主 CDK app）
-
-用户需在副账号预先完成：
-
-1. 创建 `ssh-guardian-target-role`（Trust 主账号 Lambda 角色）
-2. 在各 target region 创建 Prefix List（可提供独立 CDK stack 或脚本）
-3. 按 `target_tag` 为目标 SG 添加 Prefix List 入站规则
-
-可提供 `scripts/setup_target_account.py` 脚本自动化以上步骤。
-
-### 6.3 Bootstrap（仅主账号）
+Chalice 自动管理：
+- Lambda 函数（Python runtime）
+- API Gateway REST API（3 个路由）
+- Cognito User Pool Authorizer（引用已有 User Pool）
+- Lambda 执行角色（通过 `.chalice/config.json` 中 `autogen_policy: false` + 自定义 policy）
 
 ```bash
-# Bootstrap 主账号部署 Region
-cdk bootstrap aws://<ACCOUNT_A>/<DEPLOY_REGION>
-
-# Bootstrap 主账号其他 target Region（跨 Region 部署 PrefixListStack）
-cdk bootstrap aws://<ACCOUNT_A>/<REGION_2>
-cdk bootstrap aws://<ACCOUNT_A>/<REGION_3>
+# 部署应用
+cd chalice_app && chalice deploy --stage prod
 ```
 
-副账号不需要 CDK bootstrap，其资源通过独立脚本或 CloudFormation 模板管理。
-
-### 6.4 部署命令
+### 5.3 setup.py 初始化流程
 
 ```bash
-# 部署主账号所有 Stack（MainStack + PrefixListStack × 3）
-cdk deploy --all
-
-# 初始化副账号（独立脚本，使用副账号凭证）
-python scripts/setup_target_account.py --account <ACCOUNT_B> --regions region1,region2,region3
+# 初始化所有基础设施（主账号 + 副账号）
+python scripts/setup.py
 ```
 
-### 6.5 资源归属总结
+脚本按顺序执行：
+
+1. 副账号：创建 `ssh-guardian-target-role`（Trust 主账号 Lambda 角色）
+2. 主账号各 target region：创建 Prefix List（tag: ManagedBy=ssh-guardian）
+3. 副账号各 target region：创建 Prefix List（通过 AssumeRole）
+4. 所有 target region：按 `target_tag` 筛选 SG，添加 Prefix List 入站规则（TCP 22）
+
+所有操作幂等，重复执行安全。
+
+### 5.4 部署顺序
+
+```
+1. python scripts/setup.py          # 基础设施初始化
+2. cd chalice_app && chalice deploy  # 应用部署
+```
+
+### 5.5 资源归属总结
 
 | 资源 | 归属 | 部署方式 | 数量 |
 |------|------|---------|------|
-| API Gateway + Lambda | Account A / 部署 Region | CDK MainStack | 1 |
-| Lambda 执行角色 | Account A / 部署 Region | CDK MainStack | 1 |
-| Prefix List (Account A) | Account A / 各 target Region | CDK PrefixListStack | 3 |
-| SG 入站规则 (Account A) | Account A / 各 target Region | CDK PrefixListStack | N |
-| Target Role (Account B) | Account B / Global (IAM) | 手动或独立脚本 | 1 |
-| Prefix List (Account B) | Account B / 各 target Region | 独立脚本 | 3 |
-| SG 入站规则 (Account B) | Account B / 各 target Region | 独立脚本 | N |
+| API Gateway + Lambda | Account A / 部署 Region | chalice deploy | 1 |
+| Lambda 执行角色 | Account A / 部署 Region | chalice deploy | 1 |
+| Cognito Authorizer | Account A / 部署 Region | chalice deploy | 1 |
+| Target Role (Account B) | Account B / Global (IAM) | scripts/setup.py | 1 |
+| Prefix List (Account A) | Account A / 各 target Region | scripts/setup.py | 3 |
+| Prefix List (Account B) | Account B / 各 target Region | scripts/setup.py | 3 |
+| SG 入站规则 (Account A) | Account A / 各 target Region | scripts/setup.py | N |
+| SG 入站规则 (Account B) | Account B / 各 target Region | scripts/setup.py | N |
 | Cognito User Pool | 已有 | 不创建 | 0 |
