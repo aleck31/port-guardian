@@ -1,0 +1,11 @@
+[project]
+name = "ec2-ssh-guardian"
+version = "0.1.0"
+description = "Lightweight SSH/RDP access control for multi-account multi-region EC2"
+requires-python = ">=3.13"
+dependencies = [
+    "boto3>=1.42.62",
+    "chalice>=1.32.0",
+    "pyyaml>=6.0.3",
+    "requests>=2.31.0",
+]

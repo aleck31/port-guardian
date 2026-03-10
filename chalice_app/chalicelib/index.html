@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SG Guardian</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;color:#1a1a2e;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:1rem}
+.container{width:100%;max-width:640px}
+header{text-align:center;padding:1.5rem 0 1rem}
+header h1{font-size:1.5rem}
+header p{color:#666;font-size:.875rem;margin-top:.25rem}
+.card{background:#fff;border-radius:12px;padding:1.25rem;margin-bottom:1rem;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.card h2{font-size:1rem;margin-bottom:.75rem;color:#333}
+.ip-display{font-size:1.5rem;font-weight:600;color:#0066cc;word-break:break-all}
+table{width:100%;border-collapse:collapse;font-size:.875rem}
+th,td{padding:.5rem .75rem;border-bottom:1px solid #eee}
+th{color:#666;font-weight:600;text-align:left}
+td.status-cell{text-align:center;font-size:1.1rem;font-weight:700}
+.st-ok{color:#22c55e}
+.st-no{color:#ef4444}
+.st-load{color:#999;font-weight:400}
+.btn{display:block;width:100%;padding:.875rem;border:none;border-radius:8px;font-size:1rem;font-weight:600;cursor:pointer;text-align:center;transition:opacity .2s}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn-primary{background:#0066cc;color:#fff}
+.btn-login{background:#16213e;color:#fff}
+input[type=text],input[type=password]{width:100%;padding:.75rem;border:1px solid #ddd;border-radius:8px;font-size:.9rem;margin-bottom:.75rem}
+input:focus{outline:none;border-color:#0066cc}
+#login-error{color:#721c24;font-size:.8rem;margin-bottom:.75rem;display:none}
+#result{margin-top:.75rem;padding:.75rem;border-radius:8px;font-size:.875rem;display:none;white-space:pre-line}
+.result-ok{background:#d4edda;color:#155724;display:block}
+.result-err{background:#f8d7da;color:#721c24;display:block}
+.spinner{display:inline-block;width:1em;height:1em;border:2px solid #fff;border-top-color:transparent;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:.5em}
+@keyframes spin{to{transform:rotate(360deg)}}
+.hidden{display:none}
+@media(min-width:480px){body{padding:2rem}header h1{font-size:1.75rem}}
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>🛡️ SG Guardian</h1>
+    <p>Manage your IP whitelist across regions</p>
+  </header>
+
+  <div id="login-section" class="card">
+    <h2>Sign In</h2>
+    <form id="login-form" onsubmit="login(event)">
+      <input type="text" id="username" placeholder="Username" autocomplete="username" required>
+      <input type="password" id="password" placeholder="Password" autocomplete="current-password" required>
+      <div id="login-error"></div>
+      <button type="submit" id="login-btn" class="btn btn-login">Sign in</button>
+    </form>
+  </div>
+
+  <div id="main-section" class="hidden">
+    <div class="card">
+      <h2>Your Current IP</h2>
+      <div id="current-ip" class="ip-display">Loading…</div>
+    </div>
+    <div class="card">
+      <h2>Region Status</h2>
+      <div style="overflow-x:auto">
+        <table>
+          <thead><tr><th>Region</th><th style="text-align:center">222829864634</th><th style="text-align:center">565521294060</th></tr></thead>
+          <tbody id="region-table">
+            <tr><td>ap-southeast-1</td><td class="status-cell st-load">…</td><td class="status-cell st-load">…</td></tr>
+            <tr><td>ap-northeast-1</td><td class="status-cell st-load">…</td><td class="status-cell st-load">…</td></tr>
+            <tr><td>us-west-2</td><td class="status-cell st-load">…</td><td class="status-cell st-load">…</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div id="ports-info" style="font-size:.85rem;color:#888;margin-top:1rem">Whitelisted ports: 22, 3389</div>
+    </div>
+    <div class="card">
+      <button id="update-btn" class="btn btn-primary" onclick="updateWhitelist()">Update Whitelist</button>
+      <div id="result"></div>
+    </div>
+    <div style="text-align:center;padding:.5rem">
+      <button style="background:none;border:none;color:#999;font-size:.8rem;cursor:pointer" onclick="logout()">Sign out</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const CONFIG = {
+  cognitoEndpoint: '{{COGNITO_ENDPOINT}}',
+  clientId: '{{COGNITO_CLIENT_ID}}',
+  apiBase: window.location.pathname.replace(/\/$/, '')
+};
+
+let idToken = null;
+
+function isExpired(token) {
+  try { return JSON.parse(atob(token.split('.')[1])).exp * 1000 < Date.now(); }
+  catch { return true; }
+}
+
+function showMain() {
+  document.getElementById('login-section').classList.add('hidden');
+  document.getElementById('main-section').classList.remove('hidden');
+  fetchIp();
+  fetchStatus();
+}
+
+async function login(e) {
+  e.preventDefault();
+  const btn = document.getElementById('login-btn');
+  const errEl = document.getElementById('login-error');
+  errEl.style.display = 'none';
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Signing in…';
+  try {
+    const res = await fetch(CONFIG.cognitoEndpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-amz-json-1.1',
+        'X-Amz-Target': 'AWSCognitoIdentityProviderService.InitiateAuth'
+      },
+      body: JSON.stringify({
+        AuthFlow: 'USER_PASSWORD_AUTH',
+        ClientId: CONFIG.clientId,
+        AuthParameters: {
+          USERNAME: document.getElementById('username').value,
+          PASSWORD: document.getElementById('password').value
+        }
+      })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.message || data.__type || 'Authentication failed');
+    idToken = data.AuthenticationResult.IdToken;
+    sessionStorage.setItem('id_token', idToken);
+    showMain();
+  } catch (err) {
+    errEl.textContent = err.message;
+    errEl.style.display = 'block';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Sign in';
+  }
+}
+
+function logout() {
+  idToken = null;
+  sessionStorage.removeItem('id_token');
+  document.getElementById('main-section').classList.add('hidden');
+  document.getElementById('login-section').classList.remove('hidden');
+  document.getElementById('password').value = '';
+}
+
+function initAuth() {
+  const stored = sessionStorage.getItem('id_token');
+  if (stored && !isExpired(stored)) {
+    idToken = stored;
+    showMain();
+  }
+}
+
+async function apiFetch(path, opts = {}) {
+  const res = await fetch(CONFIG.apiBase + path, {
+    ...opts, headers: { Authorization: idToken, ...(opts.headers || {}) }
+  });
+  if (res.status === 401) { logout(); throw new Error('Unauthorized'); }
+  return res.json();
+}
+
+async function fetchIp() {
+  try {
+    const data = await apiFetch('/ip');
+    document.getElementById('current-ip').textContent = data.ip;
+  } catch {
+    document.getElementById('current-ip').textContent = 'Error loading IP';
+  }
+}
+
+const REGIONS = ['ap-southeast-1', 'ap-northeast-1', 'us-west-2'];
+const PRIMARY = '222829864634', SECONDARY = '565521294060';
+
+async function fetchStatus() {
+  try {
+    const data = await apiFetch('/status');
+    if (data.ports && data.ports.length) {
+      document.getElementById('ports-info').textContent = 'Whitelisted ports: ' + data.ports.join(', ');
+    }
+    const lookup = {};
+    data.regions.forEach(r => { lookup[r.region + '|' + r.account] = r.in_prefix_list; });
+    const tbody = document.getElementById('region-table');
+    tbody.innerHTML = REGIONS.map(reg => {
+      const c = (acct) => { const v = lookup[reg + '|' + acct]; return v ? '<td class="status-cell st-ok">✓</td>' : '<td class="status-cell st-no">✗</td>'; };
+      return '<tr><td>' + reg + '</td>' + c(PRIMARY) + c(SECONDARY) + '</tr>';
+    }).join('');
+  } catch {
+    document.getElementById('region-table').innerHTML = REGIONS.map(r =>
+      '<tr><td>' + r + '</td><td class="status-cell st-no" colspan="2">Error</td></tr>'
+    ).join('');
+  }
+}
+
+async function updateWhitelist() {
+  const btn = document.getElementById('update-btn');
+  const result = document.getElementById('result');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Updating…';
+  result.className = '';
+  result.style.display = 'none';
+  try {
+    const data = await apiFetch('/update', { method: 'POST' });
+    result.textContent = data.results.map(r => r.region + ' (' + r.account + '): ' + r.status).join('\n');
+    result.className = 'result-ok';
+    await fetchStatus();
+  } catch (e) {
+    result.textContent = 'Update failed: ' + e.message;
+    result.className = 'result-err';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Update Whitelist';
+  }
+}
+
+initAuth();
+</script>
+</body>
+</html>

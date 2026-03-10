@@ -1,1 +1,1 @@
-# ec2-ssh-guardian
+# ec2-sg-guardian

@@ -1,0 +1,22 @@
+{
+  "version": "2.0",
+  "app_name": "sg-guardian",
+  "stages": {
+    "prod": {
+      "api_gateway_stage": "api",
+      "autogen_policy": false,
+      "lambda_memory_size": 256,
+      "lambda_architecture": "arm64",
+      "environment_variables": {
+        "PRIMARY_ACCOUNT_ID": "222829864634",
+        "SECONDARY_ACCOUNT_ID": "565521294060",
+        "TARGET_ROLE_ARN": "arn:aws:iam::565521294060:role/sg-guardian-target-role",
+        "COGNITO_USER_POOL_ID": "ap-southeast-1_WBHlZF1Zf",
+        "COGNITO_CLIENT_ID": "npaahupnfnkpsfoov4hvm7ros",
+        "COGNITO_REGION": "ap-southeast-1",
+        "TARGET_REGIONS": "ap-southeast-1,ap-northeast-1,us-west-2",
+        "TARGET_PORTS": "22,3389"
+      }
+    }
+  }
+}
