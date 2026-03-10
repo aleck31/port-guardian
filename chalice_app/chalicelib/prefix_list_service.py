@@ -69,9 +69,8 @@ def get_ec2_client(account_id, region):
 # BGP route lookup
 # ---------------------------------------------------------------------------
 
-def get_bgp_prefix(ip):
-    """Return ISP allocation block via RDAP, capped at /16. Falls back to /24 then /32."""
-    import ipaddress as _ip
+def _fetch_rdap(ip):
+    """Fetch RDAP data for ip. Returns parsed JSON dict or None."""
     try:
         resp = requests.get(
             f"https://rdap.arin.net/registry/ip/{ip}",
@@ -80,26 +79,60 @@ def get_bgp_prefix(ip):
             allow_redirects=True,
         )
         resp.raise_for_status()
-        handle = resp.json().get("handle", "")
-        if " - " in handle:
-            start, end = handle.split(" - ", 1)
-            cidrs = list(_ip.summarize_address_range(
-                _ip.ip_address(start.strip()),
-                _ip.ip_address(end.strip()),
-            ))
-            if cidrs:
-                net = cidrs[0]
+        return resp.json()
+    except Exception:
+        return None
+
+
+def _rdap_cidr(data, ip):
+    """Extract CIDR from RDAP data, capped at /16. Falls back to /24."""
+    import ipaddress as _ip
+    if data:
+        try:
+            handle = data.get("handle", "")
+            if " - " in handle:
+                start, end = handle.split(" - ", 1)
+                cidrs = list(_ip.summarize_address_range(
+                    _ip.ip_address(start.strip()),
+                    _ip.ip_address(end.strip()),
+                ))
+                if cidrs:
+                    net = cidrs[0]
+                    if net.prefixlen < 16:
+                        net = _ip.ip_network(f"{ip}/16", strict=False)
+                    return str(net)
+            if "/" in handle:
+                net = _ip.ip_network(handle, strict=False)
                 if net.prefixlen < 16:
                     net = _ip.ip_network(f"{ip}/16", strict=False)
                 return str(net)
-        if "/" in handle:
-            net = _ip.ip_network(handle, strict=False)
-            if net.prefixlen < 16:
-                net = _ip.ip_network(f"{ip}/16", strict=False)
-            return str(net)
-    except Exception:
-        pass
-    return str(_ip.ip_network(f"{ip}/24", strict=False))
+        except Exception:
+            pass
+    return str(ipaddress.ip_network(f"{ip}/24", strict=False))
+
+
+def get_bgp_prefix(ip):
+    """Return ISP allocation block via RDAP, capped at /16. Falls back to /24."""
+    return _rdap_cidr(_fetch_rdap(ip), ip)
+
+
+def get_ip_info(ip):
+    """Return IP info dict from RDAP: org, network name, country, range, cidr."""
+    data = _fetch_rdap(ip)
+    info = {"ip": ip, "cidr": _rdap_cidr(data, ip)}
+    if not data:
+        return info
+    info["country"] = data.get("country", "")
+    info["name"] = data.get("name", "")
+    start = data.get("startAddress", "")
+    end = data.get("endAddress", "")
+    if start and end:
+        info["range"] = f"{start} - {end}"
+    for r in data.get("remarks", []):
+        if r.get("title") == "description" and r.get("description"):
+            info["org"] = r["description"][0]
+            break
+    return info
 
 
 # ---------------------------------------------------------------------------

@@ -4,7 +4,7 @@ from pathlib import Path
 
 from chalice import Chalice, CognitoUserPoolAuthorizer, Response
 
-from chalicelib.prefix_list_service import get_ec2_client, get_prefix_list_id, check_ip_in_prefix_list, add_ip_to_prefix_list
+from chalicelib.prefix_list_service import get_ec2_client, get_prefix_list_id, check_ip_in_prefix_list, add_ip_to_prefix_list, get_ip_info
 
 app = Chalice(app_name='sg-guardian')
 
@@ -26,20 +26,6 @@ def _get_html():
     if _HTML_TEMPLATE is None:
         _HTML_TEMPLATE = (Path(__file__).parent / 'chalicelib' / 'index.html').read_text()
     return _HTML_TEMPLATE
-
-
-def _get_api_base():
-    ctx = app.current_request.context
-    stage = ctx.get('stage', 'api')
-    api_id = ctx.get('apiId', '')
-    region = os.environ.get('COGNITO_REGION', 'ap-southeast-1')
-    if api_id:
-        return f"https://{api_id}.execute-api.{region}.amazonaws.com/{stage}"
-    headers = app.current_request.headers or {}
-    host = headers.get('host', '')
-    if host:
-        return f"https://{host}/{stage}"
-    return ''
 
 
 def _get_source_ip():
@@ -72,6 +58,7 @@ def index():
         html
         .replace('{{COGNITO_ENDPOINT}}', f'https://cognito-idp.{cognito_region}.amazonaws.com/')
         .replace('{{COGNITO_CLIENT_ID}}', os.environ.get('COGNITO_CLIENT_ID', ''))
+        # .replace('{{API_BASE}}', _get_api_base())
     )
     return Response(body=html, status_code=200, headers={'Content-Type': 'text/html'})
 
@@ -83,6 +70,15 @@ def index():
 @app.route('/ip', methods=['GET'])
 def ip():
     return {'ip': _get_source_ip()}
+
+
+# ---------------------------------------------------------------------------
+# GET /ipinfo — detailed IP information via RDAP
+# ---------------------------------------------------------------------------
+
+@app.route('/ipinfo', methods=['GET'], authorizer=authorizer)
+def ipinfo():
+    return get_ip_info(_get_source_ip())
 
 
 # ---------------------------------------------------------------------------

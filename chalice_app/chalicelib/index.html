@@ -58,6 +58,7 @@ input:focus{outline:none;border-color:#0066cc}
     <div class="card">
       <h2>Your Current IP</h2>
       <div id="current-ip" class="ip-display">Loading…</div>
+      <div id="ip-info" style="font-size:.8rem;color:#888;margin-top:.5rem;line-height:1.6"></div>
     </div>
     <div class="card">
       <h2>Region Status</h2>
@@ -101,6 +102,7 @@ function showMain() {
   document.getElementById('login-section').classList.add('hidden');
   document.getElementById('main-section').classList.remove('hidden');
   fetchIp();
+  fetchIpInfo();
   fetchStatus();
 }
 
@@ -172,6 +174,18 @@ async function fetchIp() {
   } catch {
     document.getElementById('current-ip').textContent = 'Error loading IP';
   }
+}
+
+async function fetchIpInfo() {
+  try {
+    const d = await apiFetch('/ipinfo');
+    const ip = document.getElementById('current-ip');
+    if (d.country) ip.innerHTML = d.ip + ' <span style="font-size:.75rem;color:#999">(' + d.country + ')</span>';
+    const lines = [];
+    if (d.org) lines.push(d.org);
+    if (d.cidr || d.range) lines.push([d.cidr ? 'CIDR: ' + d.cidr : '', d.range ? 'Range: ' + d.range : ''].filter(Boolean).join(' &middot; '));
+    document.getElementById('ip-info').innerHTML = lines.join('<br>');
+  } catch {}
 }
 
 const REGIONS = ['ap-southeast-1', 'ap-northeast-1', 'us-west-2'];
