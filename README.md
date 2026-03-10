@@ -1,22 +1,8 @@
-# EC2 SSH Guardian
+# Port Guardian
 
 Lightweight remote management port (SSH/RDP) access control for multi-account, multi-region AWS environments.
 
-## Problem
-
-- Management ports (SSH 22, RDP 3389) exposed to the public internet are a security risk
-- User IPs change frequently (different ISPs, locations), making static whitelists impractical
-- Maintaining Security Groups across multiple accounts and regions is tedious and error-prone
-
-## Solution
-
-A serverless web app where authenticated users can view their current IP and one-click update AWS Managed Prefix Lists across all target regions. Security Groups reference these Prefix Lists, so one update propagates everywhere.
-
-```
-Browser → API Gateway + Cognito → Lambda → Prefix Lists (2 accounts × 3 regions)
-                                                ↓
-                                        Security Groups (auto-synced)
-```
+It provides a serverless web app that allows authenticated users to view their current IP address and update AWS Managed Prefix Lists across all target regions with a single click. Security Groups reference these Prefix Lists, so a single update propagates everywhere.
 
 ## Features
 
@@ -30,6 +16,12 @@ Browser → API Gateway + Cognito → Lambda → Prefix Lists (2 accounts × 3 r
 - **Fast IP endpoint** — Unauthenticated `/ip` route for instant IP display
 
 ## Architecture
+
+```
+Browser → API Gateway + Cognito → Lambda → Prefix Lists (multi-accounts × multi-regions)
+                                                ↓
+                                        Security Groups (auto-synced)
+```
 
 | Component | Technology |
 |-----------|-----------|
@@ -77,9 +69,21 @@ cp config.yaml.example config.yaml
 # Install dependencies
 pip install -e .
 
-# Deploy Lambda + API Gateway, create prefix lists, sync SG rules
+# Full init: deploy Lambda + API Gateway, create IAM roles, prefix lists, sync SG rules
+python scripts/setup.py --init
+
+# Deploy only (no infra changes) — default when no flag is given
 python scripts/setup.py
+
+# Re-sync SG ingress rules (e.g. after adding new tagged Security Groups)
+python scripts/setup.py --sync-sg
 ```
+
+| Flag | What it does |
+|------|-------------|
+| (none) | Deploy Chalice app (Lambda + API Gateway) only |
+| `--init` | Full init: deploy + IAM role + prefix lists + SG rule sync |
+| `--sync-sg` | Re-sync SG ingress rules to reference prefix lists |
 
 ### Custom Domain (Optional)
 
@@ -88,31 +92,6 @@ To use a custom domain instead of the default API Gateway URL:
 1. Create a custom domain in API Gateway
 2. Map the `/api` stage to `/` (base path)
 3. The frontend uses relative paths, so it works on any domain automatically
-
-## Configuration Reference
-
-```yaml
-accounts:
-  primary:
-    id: "111111111111"
-    regions: [ap-southeast-1, ap-northeast-1, us-west-2]
-  secondary:
-    id: "222222222222"
-    role_arn: "arn:aws:iam::222222222222:role/sg-guardian-target-role"
-    regions: [ap-southeast-1, ap-northeast-1, us-west-2]
-
-cognito:
-  region: ap-southeast-1
-  user_pool_id: ap-southeast-1_XXXXXXXXX
-  client_id: xxxxxxxxxxxxxxxxxxxxxxxxx
-
-target_tag:
-  key: sg-guardian
-  value: enabled
-
-target_ports: [22, 3389]
-max_entries: 20
-```
 
 ## API Endpoints
 
