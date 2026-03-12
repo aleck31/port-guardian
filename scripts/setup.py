@@ -1,9 +1,9 @@
-"""SG Guardian — deployment and infrastructure setup.
+"""Port Guardian — deployment and infrastructure setup.
 
 Usage:
-  python setup.py              Deploy chalice app, print API URL and role ARN
-  python setup.py --init       Full init: deploy + IAM role + prefix lists + SG sync
-  python setup.py --sync-sg    Sync SG ingress rules (add missing, remove stale)
+  python setup.py              Deploy chalice app (syncs config.yaml → config.json)
+  python setup.py --sync-sg    Deploy + sync SG ingress rules
+  python setup.py --init       Deploy + IAM role + prefix lists + SG sync
 """
 
 import argparse
@@ -106,14 +106,28 @@ def chalice_deploy():
     return role_arn, api_url
 
 
-def cmd_deploy():
-    print('[1/1] Deploying chalice app...')
-    chalice_deploy()
-    print('\nDone.')
+def sync_chalice_config(cfg):
+    """Sync config.yaml values into .chalice/config.json environment variables."""
+    config_path = Path(__file__).resolve().parent.parent / 'chalice_app' / '.chalice' / 'config.json'
+    if not config_path.exists():
+        import shutil
+        shutil.copy(str(config_path) + '.example', config_path)
+    chalice_cfg = json.loads(config_path.read_text())
+    env = chalice_cfg['stages']['prod']['environment_variables']
+    env['PRIMARY_ACCOUNT_ID'] = cfg['accounts']['primary']['id']
+    env['SECONDARY_ACCOUNT_ID'] = cfg['accounts']['secondary']['id']
+    env['TARGET_ROLE_ARN'] = cfg['accounts']['secondary']['role_arn']
+    env['COGNITO_USER_POOL_ID'] = cfg['cognito']['user_pool_id']
+    env['COGNITO_CLIENT_ID'] = cfg['cognito']['client_id']
+    env['COGNITO_REGION'] = cfg['cognito']['region']
+    env['TARGET_REGIONS'] = ','.join(cfg['accounts']['primary']['regions'])
+    env['TARGET_PORTS'] = ','.join(str(p) for p in cfg.get('target_ports', [22, 3389]))
+    config_path.write_text(json.dumps(chalice_cfg, indent=2) + '\n')
+
 
 
 # ---------------------------------------------------------------------------
-# Command: --init
+# Infrastructure helpers
 # ---------------------------------------------------------------------------
 
 def ensure_target_role(cfg, lambda_role_arn):
@@ -195,31 +209,8 @@ def ensure_prefix_list(ec2, account_id, region, cfg):
     return pl_id
 
 
-def cmd_init(cfg):
-    print('[1/4] Deploying chalice app...')
-    lambda_role_arn, _ = chalice_deploy()
-    if not lambda_role_arn:
-        sys.exit('Could not parse Lambda role ARN from chalice deploy output')
-    print()
-
-    print('[2/4] Ensuring IAM target role in secondary account...')
-    ensure_target_role(cfg, lambda_role_arn)
-    print()
-
-    print('[3/4] Creating Prefix Lists...')
-    for account_id, region, ec2 in get_all_ec2_clients(cfg):
-        ensure_prefix_list(ec2, account_id, region, cfg)
-    print()
-
-    print('[4/4] Syncing Security Group rules...')
-    sync_sg_rules(cfg)
-    print()
-
-    print('Done.')
-
-
 # ---------------------------------------------------------------------------
-# Command: --sync-sg
+# SG sync
 # ---------------------------------------------------------------------------
 
 def sync_sg_rules(cfg):
@@ -244,6 +235,24 @@ def sync_sg_rules(cfg):
 
         for sg in tagged_sgs:
             sg_id = sg['GroupId']
+            # Remove stale port rules (ports referencing our PL but no longer in config)
+            for rule in sg.get('IpPermissions', []):
+                if rule.get('IpProtocol') != 'tcp':
+                    continue
+                rule_port = rule.get('FromPort')
+                matching_pls = [p for p in rule.get('PrefixListIds', []) if p['PrefixListId'] == pl_id]
+                if matching_pls and rule_port not in ports:
+                    ec2.revoke_security_group_ingress(
+                        GroupId=sg_id,
+                        IpPermissions=[{
+                            'IpProtocol': 'tcp',
+                            'FromPort': rule_port,
+                            'ToPort': rule.get('ToPort', rule_port),
+                            'PrefixListIds': matching_pls,
+                        }],
+                    )
+                    print(f'    {sg_id} port {rule_port} ← {pl_id} — removed (not in config)')
+            # Add missing port rules
             for port in ports:
                 has_rule = any(
                     r.get('IpProtocol') == 'tcp'
@@ -297,11 +306,6 @@ def sync_sg_rules(cfg):
                 print(f'    {sg_id} — removed {len(rules_to_revoke)} stale rule(s)')
 
 
-def cmd_sync_sg(cfg):
-    print('[1/1] Syncing Security Group rules...')
-    sync_sg_rules(cfg)
-    print('\nDone.')
-
 
 # ---------------------------------------------------------------------------
 # Main
@@ -314,14 +318,48 @@ def main():
     group.add_argument('--sync-sg', action='store_true', help='Sync SG ingress rules')
     args = parser.parse_args()
 
+    cfg = load_config()
+    sync_chalice_config(cfg)
+
+    steps = []
     if args.init:
-        cfg = load_config()
-        cmd_init(cfg)
+        steps = ['deploy', 'iam', 'prefix_lists', 'sync_sg']
     elif args.sync_sg:
-        cfg = load_config()
-        cmd_sync_sg(cfg)
+        steps = ['deploy', 'sync_sg']
     else:
-        cmd_deploy()
+        steps = ['deploy']
+
+    total = len(steps)
+    step = 0
+
+    if 'deploy' in steps:
+        step += 1
+        print(f'[{step}/{total}] Deploying chalice app...')
+        role_arn, _ = chalice_deploy()
+        print()
+
+    if 'iam' in steps:
+        step += 1
+        print(f'[{step}/{total}] Ensuring IAM target role in secondary account...')
+        if not role_arn:
+            sys.exit('Could not parse Lambda role ARN from chalice deploy output')
+        ensure_target_role(cfg, role_arn)
+        print()
+
+    if 'prefix_lists' in steps:
+        step += 1
+        print(f'[{step}/{total}] Creating Prefix Lists...')
+        for account_id, region, ec2 in get_all_ec2_clients(cfg):
+            ensure_prefix_list(ec2, account_id, region, cfg)
+        print()
+
+    if 'sync_sg' in steps:
+        step += 1
+        print(f'[{step}/{total}] Syncing Security Group rules...')
+        sync_sg_rules(cfg)
+        print()
+
+    print('Done.')
 
 
 if __name__ == '__main__':

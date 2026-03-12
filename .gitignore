@@ -13,6 +13,7 @@ config.yaml
 # Chalice
 chalice_app/.chalice/deployed/
 chalice_app/.chalice/deployments/
+chalice_app/.chalice/config.json
 
 # Lock file
 uv.lock
