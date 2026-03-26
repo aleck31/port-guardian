@@ -6,7 +6,7 @@ from chalice import Chalice, CognitoUserPoolAuthorizer, Response
 
 from chalicelib.prefix_list_service import get_ec2_client, get_prefix_list_id, check_ip_in_prefix_list, add_ip_to_prefix_list, get_ip_info
 
-app = Chalice(app_name='sg-guardian')
+app = Chalice(app_name='port-guardian')
 
 COGNITO_USER_POOL_ARN = (
     f"arn:aws:cognito-idp:{os.environ.get('COGNITO_REGION', 'ap-southeast-1')}:"
@@ -15,7 +15,7 @@ COGNITO_USER_POOL_ARN = (
 )
 
 authorizer = CognitoUserPoolAuthorizer(
-    'SshGuardianAuth', provider_arns=[COGNITO_USER_POOL_ARN]
+    'PortGuardianAuth', provider_arns=[COGNITO_USER_POOL_ARN]
 )
 
 _HTML_TEMPLATE = None

@@ -36,9 +36,9 @@ Browser → API Gateway + Cognito → Lambda → Prefix Lists (multi-accounts ×
 ```
 ├── config.yaml.example    # Configuration template (copy to config.yaml)
 ├── pyproject.toml          # Python dependencies
-├── scripts/
-│   └── setup.py            # Deployment & SG sync script
-└── chalice_app/
+
+├── setup.py                # Deployment & SG sync script
+└── app/
     ├── app.py              # Lambda routes (parallel execution)
     ├── chalicelib/
     │   ├── prefix_list_service.py  # EC2 client factory, prefix list ops, RDAP lookup
@@ -65,7 +65,7 @@ cp config.yaml.example config.yaml
 # Edit config.yaml with your account IDs, regions, Cognito settings
 ```
 
-`chalice_app/.chalice/config.json` will be auto-generated from `config.yaml` on first deploy. If you need to change Chalice-specific settings (memory, architecture), edit `config.json.example` and delete `config.json` to regenerate.
+`app/.chalice/config.json` will be auto-generated from `config.yaml` on first deploy. If you need to change Chalice-specific settings (memory, architecture), edit `config.json.example` and delete `config.json` to regenerate.
 
 ### Deploy
 
@@ -76,13 +76,13 @@ All commands read `config.yaml` as the single source of truth, auto-sync to Chal
 uv sync
 
 # Deploy only (syncs config.yaml → Lambda env vars)
-uv run scripts/setup.py
+uv run setup.py
 
 # Full init: deploy + IAM role + prefix lists + SG rule sync
-uv run scripts/setup.py --init
+uv run setup.py --init
 
 # Deploy + sync SG ingress rules (e.g. after changing target_ports)
-uv run scripts/setup.py --sync-sg
+uv run setup.py --sync-sg
 ```
 
 | Flag | What it does |

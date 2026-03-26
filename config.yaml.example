@@ -2,14 +2,14 @@
 
 accounts:
   primary:
-    id: "222829864634"
+    id: "111111111111"
     regions:
       - ap-southeast-1
       - ap-northeast-1
       - us-west-2
   secondary:
-    id: "565521294060"
-    role_arn: "arn:aws:iam::565521294060:role/ssh-guardian-target-role"
+    id: "222222222222"
+    role_arn: "arn:aws:iam::222222222222:role/port-guardian-target-role"
     regions:
       - ap-southeast-1
       - ap-northeast-1
@@ -17,11 +17,11 @@ accounts:
 
 cognito:
   region: ap-southeast-1
-  user_pool_id: ap-southeast-1_WBHlZF1Zf
-  client_id: npaahupnfnkpsfoov4hvm7ros
+  user_pool_id: ap-southeast-1_XXXXXXXXX
+  client_id: xxxxxxxxxxxxxxxxxxxxxxxxx
 
 target_tag:
-  key: ssh-guardian
+  key: port-guardian
   value: enabled
 
 target_ports:

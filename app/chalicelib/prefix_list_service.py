@@ -15,9 +15,9 @@ from botocore.config import Config
 
 _BOTO_CFG = Config(connect_timeout=5, read_timeout=8, retries={"max_attempts": 1})
 
-MANAGED_BY_TAG = 'sg-guardian'
-PREFIX_LIST_NAME = 'sg-guardian-whitelist'
-DESCRIPTION_PREFIX = 'sg-guardian'
+MANAGED_BY_TAG = 'port-guardian'
+PREFIX_LIST_NAME = 'port-guardian-whitelist'
+DESCRIPTION_PREFIX = 'port-guardian'
 
 # Cache: {role_arn: (credentials_dict, expiry_timestamp)}
 _sts_cache: dict = {}
@@ -51,7 +51,7 @@ def get_ec2_client(account_id, region):
     if not creds:
         sts = boto3.client('sts', config=_BOTO_CFG)
         resp = sts.assume_role(
-            RoleArn=role_arn, RoleSessionName='sg-guardian-lambda'
+            RoleArn=role_arn, RoleSessionName='port-guardian-lambda'
         )
         creds = resp['Credentials']
         expiry = creds['Expiration'].timestamp()
@@ -75,7 +75,7 @@ def _fetch_rdap(ip):
         resp = requests.get(
             f"https://rdap.arin.net/registry/ip/{ip}",
             timeout=6,
-            headers={"User-Agent": "sg-guardian/1.0"},
+            headers={"User-Agent": "port-guardian/1.0"},
             allow_redirects=True,
         )
         resp.raise_for_status()
@@ -140,7 +140,7 @@ def get_ip_info(ip):
 # ---------------------------------------------------------------------------
 
 def get_prefix_list_id(ec2_client):
-    """Find the sg-guardian managed prefix list ID by name."""
+    """Find the port-guardian managed prefix list ID by name."""
     resp = ec2_client.describe_managed_prefix_lists(
         Filters=[{'Name': 'prefix-list-name', 'Values': [PREFIX_LIST_NAME]}]
     )

@@ -1,7 +1,7 @@
 [project]
-name = "ec2-ssh-guardian"
-version = "0.1.0"
-description = "Lightweight SSH/RDP access control for multi-account multi-region EC2"
+name = "port-guardian"
+version = "0.2.0"
+description = "Serverless IP whitelist manager for EC2 management ports across multi-account, multi-region AWS environments."
 requires-python = ">=3.13"
 dependencies = [
     "boto3>=1.42.62",

@@ -15,11 +15,11 @@ from pathlib import Path
 import boto3
 import yaml
 
-ROLE_NAME = 'sg-guardian-target-role'
-PREFIX_LIST_NAME = 'sg-guardian-whitelist'
+ROLE_NAME = 'port-guardian-target-role'
+PREFIX_LIST_NAME = 'port-guardian-whitelist'
 MANAGED_BY_KEY = 'ManagedBy'
-MANAGED_BY_VALUE = 'sg-guardian'
-POLICY_NAME = 'sg-guardian-prefix-list-policy'
+MANAGED_BY_VALUE = 'port-guardian'
+POLICY_NAME = 'port-guardian-prefix-list-policy'
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +78,7 @@ def find_prefix_list(ec2):
 
 def chalice_deploy():
     """Run chalice deploy, return (role_arn, api_url) from deployed state."""
-    chalice_dir = Path(__file__).resolve().parent.parent / 'chalice_app'
+    chalice_dir = Path(__file__).resolve().parent.parent / 'app'
     result = subprocess.run(
         ['uv', 'run', 'chalice', 'deploy', '--stage', 'prod'],
         cwd=chalice_dir, capture_output=True, text=True,
@@ -108,7 +108,7 @@ def chalice_deploy():
 
 def sync_chalice_config(cfg):
     """Sync config.yaml values into .chalice/config.json environment variables."""
-    config_path = Path(__file__).resolve().parent.parent / 'chalice_app' / '.chalice' / 'config.json'
+    config_path = Path(__file__).resolve().parent.parent / 'app' / '.chalice' / 'config.json'
     if not config_path.exists():
         import shutil
         shutil.copy(str(config_path) + '.example', config_path)
@@ -177,7 +177,7 @@ def ensure_target_role(cfg, lambda_role_arn):
     iam.create_role(
         RoleName=ROLE_NAME,
         AssumeRolePolicyDocument=json.dumps(trust_policy),
-        Description='SG Guardian cross-account prefix list access',
+        Description='Port Guardian cross-account prefix list access',
     )
     iam.put_role_policy(
         RoleName=ROLE_NAME, PolicyName=POLICY_NAME,
@@ -271,7 +271,7 @@ def sync_sg_rules(cfg):
                             'IpProtocol': 'tcp',
                             'FromPort': port,
                             'ToPort': port,
-                            'PrefixListIds': [{'PrefixListId': pl_id, 'Description': 'sg-guardian'}],
+                            'PrefixListIds': [{'PrefixListId': pl_id, 'Description': 'port-guardian'}],
                         }],
                     )
                     print(f'    {sg_id} port {port} ← {pl_id} — added')
@@ -312,7 +312,7 @@ def sync_sg_rules(cfg):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description='SG Guardian setup')
+    parser = argparse.ArgumentParser(description='Port Guardian setup')
     group = parser.add_mutually_exclusive_group()
     group.add_argument('--init', action='store_true', help='Full init: deploy + IAM + prefix lists + SG sync')
     group.add_argument('--sync-sg', action='store_true', help='Sync SG ingress rules')

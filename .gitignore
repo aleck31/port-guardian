@@ -3,17 +3,13 @@ __pycache__/
 *.pyc
 .venv/
 
+# Chalice
+app/.chalice/*
+!app/.chalice/config.json.example
+
 # Environment
 .python-version
 config.yaml
+.dev
 
-# Dev notes
-.dev/
 
-# Chalice
-chalice_app/.chalice/deployed/
-chalice_app/.chalice/deployments/
-chalice_app/.chalice/config.json
-
-# Lock file
-uv.lock
