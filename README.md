@@ -1,19 +1,19 @@
 # Port Guardian
 
-Lightweight remote management port (SSH/RDP) access control for multi-account, multi-region AWS environments.
+Serverless IP whitelist manager for EC2 management ports across multi-account, multi-region AWS environments.
 
-It provides a serverless web app that allows authenticated users to view their current IP address and update AWS Managed Prefix Lists across all target regions with a single click. Security Groups reference these Prefix Lists, so a single update propagates everywhere.
+Port Guardian provides a web UI where authenticated users can view their current IP and whitelist status, and update AWS Managed Prefix Lists across all target regions with one click. Security Groups reference these Prefix Lists, so a single update propagates everywhere instantly.
 
 ## Features
 
 - **Web UI** — Login, view IP & whitelist status, one-click update
+- **IP info** — Shows ISP, CIDR block, range and country via RDAP
 - **Multi-account** — Primary account (direct) + secondary account (STS AssumeRole)
-- **Multi-region** — Concurrent updates across 6 targets (2 accounts × 3 regions)
+- **Multi-region** — Concurrent updates across all targets with ThreadPoolExecutor
 - **RDAP prefix lookup** — Whitelists ISP allocation block (e.g. /18) instead of /32, reducing churn
 - **CIDR containment** — Checks if IP falls within any existing prefix, not just exact match
 - **FIFO eviction** — Auto-removes oldest entry when prefix list is full
 - **Cognito auth** — API endpoints protected by Cognito User Pool authorizer
-- **Fast IP endpoint** — Unauthenticated `/ip` route for instant IP display
 
 ## Architecture
 

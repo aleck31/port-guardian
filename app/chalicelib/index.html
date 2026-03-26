@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Port Guardian</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛡️</text></svg>">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;color:#1a1a2e;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:1rem}
@@ -49,6 +50,10 @@ input:focus{outline:none;border-color:#0066cc}
     <form id="login-form" onsubmit="login(event)">
       <input type="text" id="username" placeholder="Username" autocomplete="username" required>
       <input type="password" id="password" placeholder="Password" autocomplete="current-password" required>
+      <div style="display:flex;align-items:center;margin-bottom:.75rem;gap:.5rem">
+        <input type="checkbox" id="remember-me" style="width:auto;margin:0">
+        <label for="remember-me" style="font-size:.85rem;color:#666;cursor:pointer">Remember me</label>
+      </div>
       <div id="login-error"></div>
       <button type="submit" id="login-btn" class="btn btn-login">Sign in</button>
     </form>
@@ -133,6 +138,13 @@ async function login(e) {
     if (!res.ok) throw new Error(data.message || data.__type || 'Authentication failed');
     idToken = data.AuthenticationResult.IdToken;
     sessionStorage.setItem('id_token', idToken);
+    if (document.getElementById('remember-me').checked) {
+      localStorage.setItem('saved_username', document.getElementById('username').value);
+      localStorage.setItem('saved_password', document.getElementById('password').value);
+    } else {
+      localStorage.removeItem('saved_username');
+      localStorage.removeItem('saved_password');
+    }
     showMain();
   } catch (err) {
     errEl.textContent = err.message;
@@ -152,6 +164,13 @@ function logout() {
 }
 
 function initAuth() {
+  const savedUser = localStorage.getItem('saved_username');
+  const savedPass = localStorage.getItem('saved_password');
+  if (savedUser) {
+    document.getElementById('username').value = savedUser;
+    document.getElementById('remember-me').checked = true;
+  }
+  if (savedPass) document.getElementById('password').value = savedPass;
   const stored = sessionStorage.getItem('id_token');
   if (stored && !isExpired(stored)) {
     idToken = stored;

@@ -27,7 +27,7 @@ POLICY_NAME = 'port-guardian-prefix-list-policy'
 # ---------------------------------------------------------------------------
 
 def load_config():
-    path = Path(__file__).resolve().parent.parent / 'config.yaml'
+    path = Path(__file__).resolve().parent / 'config.yaml'
     if not path.exists():
         sys.exit(f'Config not found: {path}')
     with open(path) as f:
@@ -78,7 +78,7 @@ def find_prefix_list(ec2):
 
 def chalice_deploy():
     """Run chalice deploy, return (role_arn, api_url) from deployed state."""
-    chalice_dir = Path(__file__).resolve().parent.parent / 'app'
+    chalice_dir = Path(__file__).resolve().parent / 'app'
     result = subprocess.run(
         ['uv', 'run', 'chalice', 'deploy', '--stage', 'prod'],
         cwd=chalice_dir, capture_output=True, text=True,
@@ -108,7 +108,7 @@ def chalice_deploy():
 
 def sync_chalice_config(cfg):
     """Sync config.yaml values into .chalice/config.json environment variables."""
-    config_path = Path(__file__).resolve().parent.parent / 'app' / '.chalice' / 'config.json'
+    config_path = Path(__file__).resolve().parent / 'app' / '.chalice' / 'config.json'
     if not config_path.exists():
         import shutil
         shutil.copy(str(config_path) + '.example', config_path)
