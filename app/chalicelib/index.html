@@ -8,7 +8,7 @@
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;color:#1a1a2e;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:1rem}
-.container{width:100%;max-width:640px}
+.container{width:100%;max-width:660px}
 header{text-align:center;padding:1.5rem 0 1rem}
 header h1{font-size:1.5rem}
 header p{color:#666;font-size:.875rem;margin-top:.25rem}
@@ -34,11 +34,16 @@ input:focus{outline:none;border-color:#0066cc}
 .result-err{background:#f8d7da;color:#721c24;display:block}
 .spinner{display:inline-block;width:1em;height:1em;border:2px solid #fff;border-top-color:transparent;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:.5em}
 @keyframes spin{to{transform:rotate(360deg)}}
+.btn-sm{display:inline-block;width:auto;padding:.25rem .6rem;font-size:.75rem;border-radius:6px;background:#ef4444;color:#fff;border:none;cursor:pointer;font-weight:600}
+.btn-sm:hover{opacity:.85}
 .hidden{display:none}
+#overlay{position:fixed;inset:0;background:rgba(0,0,0,.4);display:none;align-items:center;justify-content:center;z-index:999}
+#overlay .spinner{width:2.5rem;height:2.5rem;border-width:4px;border-color:rgba(255,255,255,.3);border-top-color:#fff;margin:0}
 @media(min-width:480px){body{padding:2rem}header h1{font-size:1.75rem}}
 </style>
 </head>
 <body>
+<div id="overlay"><span class="spinner"></span></div>
 <div class="container">
   <header>
     <h1>🛡️ Port Guardian</h1>
@@ -60,28 +65,32 @@ input:focus{outline:none;border-color:#0066cc}
   </div>
 
   <div id="main-section" class="hidden">
-    <div class="card">
-      <h2>Your Current IP</h2>
-      <div id="current-ip" class="ip-display">Loading…</div>
-      <div id="ip-info" style="font-size:.8rem;color:#888;margin-top:.5rem;line-height:1.6"></div>
+    <div class="card" style="display:flex;justify-content:space-between;align-items:flex-start;gap:1rem">
+      <div style="flex:1;min-width:0">
+        <h2>Your Current IP</h2>
+        <div id="current-ip" class="ip-display">Loading…</div>
+        <div id="ip-info" style="font-size:.8rem;color:#888;margin-top:.5rem;line-height:1.6"></div>
+      </div>
+      <div style="flex-shrink:0;padding-top:1.5rem">
+        <button id="update-btn" class="btn btn-primary" onclick="updateWhitelist()" disabled style="width:auto;padding:.6rem 1.2rem;font-size:.9rem;opacity:.4">Add</button>
+      </div>
     </div>
+    <div id="result" style="margin-bottom:.75rem;padding:.75rem;border-radius:8px;font-size:.875rem;display:none;white-space:pre-line"></div>
     <div class="card">
       <h2>Region Status</h2>
       <div style="overflow-x:auto">
-        <table>
-          <thead><tr><th>Region</th><th style="text-align:center">222829864634</th><th style="text-align:center">565521294060</th></tr></thead>
+        <table id="region-table-wrap">
+          <thead id="region-thead"><tr><th>Region</th><th style="text-align:center">…</th><th style="text-align:center">…</th></tr></thead>
           <tbody id="region-table">
-            <tr><td>ap-southeast-1</td><td class="status-cell st-load">…</td><td class="status-cell st-load">…</td></tr>
-            <tr><td>ap-northeast-1</td><td class="status-cell st-load">…</td><td class="status-cell st-load">…</td></tr>
-            <tr><td>us-west-2</td><td class="status-cell st-load">…</td><td class="status-cell st-load">…</td></tr>
+            <tr><td colspan="3" style="color:#999;text-align:center">Loading…</td></tr>
           </tbody>
         </table>
       </div>
       <div id="ports-info" style="font-size:.85rem;color:#888;margin-top:1rem">Whitelisted ports: 22, 3389</div>
     </div>
     <div class="card">
-      <button id="update-btn" class="btn btn-primary" onclick="updateWhitelist()">Update Whitelist</button>
-      <div id="result"></div>
+      <h2>Whitelist Entries</h2>
+      <div id="entries-body" style="margin-top:.75rem;font-size:.85rem;color:#999">Loading…</div>
     </div>
     <div style="text-align:center;padding:.5rem">
       <button style="background:none;border:none;color:#999;font-size:.8rem;cursor:pointer" onclick="logout()">Sign out</button>
@@ -139,11 +148,9 @@ async function login(e) {
     idToken = data.AuthenticationResult.IdToken;
     sessionStorage.setItem('id_token', idToken);
     if (document.getElementById('remember-me').checked) {
-      localStorage.setItem('saved_username', document.getElementById('username').value);
-      localStorage.setItem('saved_password', document.getElementById('password').value);
+      await saveCredentials(document.getElementById('username').value, document.getElementById('password').value);
     } else {
-      localStorage.removeItem('saved_username');
-      localStorage.removeItem('saved_password');
+      localStorage.removeItem(CRED_KEY);
     }
     showMain();
   } catch (err) {
@@ -164,13 +171,13 @@ function logout() {
 }
 
 function initAuth() {
-  const savedUser = localStorage.getItem('saved_username');
-  const savedPass = localStorage.getItem('saved_password');
-  if (savedUser) {
-    document.getElementById('username').value = savedUser;
-    document.getElementById('remember-me').checked = true;
-  }
-  if (savedPass) document.getElementById('password').value = savedPass;
+  loadCredentials().then(creds => {
+    if (creds) {
+      document.getElementById('username').value = creds.username;
+      document.getElementById('password').value = creds.password;
+      document.getElementById('remember-me').checked = true;
+    }
+  });
   const stored = sessionStorage.getItem('id_token');
   if (stored && !isExpired(stored)) {
     idToken = stored;
@@ -183,6 +190,7 @@ async function apiFetch(path, opts = {}) {
     ...opts, headers: { Authorization: idToken, ...(opts.headers || {}) }
   });
   if (res.status === 401) { logout(); throw new Error('Unauthorized'); }
+  if (!res.ok) throw new Error('HTTP ' + res.status);
   return res.json();
 }
 
@@ -207,7 +215,47 @@ async function fetchIpInfo() {
   } catch {}
 }
 
-const REGIONS = ['ap-southeast-1', 'ap-northeast-1', 'us-west-2'];
+const CRED_KEY = 'pg_creds';
+const PBKDF2_SALT = new TextEncoder().encode('port-guardian');
+
+async function deriveKey(username) {
+  const raw = await crypto.subtle.importKey('raw', new TextEncoder().encode(username), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    {name: 'PBKDF2', salt: PBKDF2_SALT, iterations: 10000, hash: 'SHA-256'},
+    raw, {name: 'AES-GCM', length: 256}, false, ['encrypt', 'decrypt']
+  );
+}
+
+async function saveCredentials(username, password) {
+  const key = await deriveKey(username);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const encrypted = new Uint8Array(await crypto.subtle.encrypt({name: 'AES-GCM', iv}, key, new TextEncoder().encode(password)));
+  const uBytes = new TextEncoder().encode(username);
+  const packed = new Uint8Array(1 + uBytes.length + 12 + encrypted.length);
+  packed[0] = uBytes.length;
+  packed.set(uBytes, 1);
+  packed.set(iv, 1 + uBytes.length);
+  packed.set(encrypted, 1 + uBytes.length + 12);
+  localStorage.setItem(CRED_KEY, btoa(String.fromCharCode(...packed)));
+}
+
+async function loadCredentials() {
+  const saved = localStorage.getItem(CRED_KEY);
+  if (!saved) return null;
+  try {
+    const packed = Uint8Array.from(atob(saved), c => c.charCodeAt(0));
+    const uLen = packed[0];
+    const username = new TextDecoder().decode(packed.slice(1, 1 + uLen));
+    const iv = packed.slice(1 + uLen, 1 + uLen + 12);
+    const encrypted = packed.slice(1 + uLen + 12);
+    const key = await deriveKey(username);
+    const decrypted = await crypto.subtle.decrypt({name: 'AES-GCM', iv}, key, encrypted);
+    return {username, password: new TextDecoder().decode(decrypted)};
+  } catch {
+    localStorage.removeItem(CRED_KEY);
+    return null;
+  }
+}
 const PRIMARY = '222829864634', SECONDARY = '565521294060';
 
 async function fetchStatus() {
@@ -216,38 +264,77 @@ async function fetchStatus() {
     if (data.ports && data.ports.length) {
       document.getElementById('ports-info').textContent = 'Whitelisted ports: ' + data.ports.join(', ');
     }
+    // Derive unique accounts and regions from response
+    const accounts = [...new Set(data.regions.map(r => r.account))];
+    const regions = [...new Set(data.regions.map(r => r.region))];
     const lookup = {};
     data.regions.forEach(r => { lookup[r.region + '|' + r.account] = r.in_prefix_list; });
-    const tbody = document.getElementById('region-table');
-    tbody.innerHTML = REGIONS.map(reg => {
-      const c = (acct) => { const v = lookup[reg + '|' + acct]; return v ? '<td class="status-cell st-ok">✓</td>' : '<td class="status-cell st-no">✗</td>'; };
-      return '<tr><td>' + reg + '</td>' + c(PRIMARY) + c(SECONDARY) + '</tr>';
-    }).join('');
-  } catch {
-    document.getElementById('region-table').innerHTML = REGIONS.map(r =>
-      '<tr><td>' + r + '</td><td class="status-cell st-no" colspan="2">Error</td></tr>'
+    // Update table header
+    document.getElementById('region-thead').innerHTML =
+      '<tr><th>Region</th>' + accounts.map(a => '<th style="text-align:center">' + a + '</th>').join('') + '</tr>';
+    // Update table body
+    document.getElementById('region-table').innerHTML = regions.map(reg =>
+      '<tr><td>' + reg + '</td>' + accounts.map(acct => {
+        const v = lookup[reg + '|' + acct];
+        return v ? '<td class="status-cell st-ok">✓</td>' : '<td class="status-cell st-no">✗</td>';
+      }).join('') + '</tr>'
     ).join('');
+    renderEntries(data.entries || []);
+    const needsUpdate = data.regions.some(r => !r.in_prefix_list);
+    const btn = document.getElementById('update-btn');
+    btn.disabled = !needsUpdate;
+    btn.style.opacity = needsUpdate ? '1' : '.4';
+  } catch (e) {
+    document.getElementById('region-table').innerHTML = '<tr><td colspan="3" style="color:#ef4444">Error: ' + e.message + '</td></tr>';
+    document.getElementById('entries-body').textContent = 'Error loading entries';
   }
 }
+
+function renderEntries(entries) {
+  const body = document.getElementById('entries-body');
+  if (!entries.length) { body.textContent = 'No entries'; return; }
+  body.innerHTML = '<table style="width:100%"><thead><tr><th>CIDR</th><th>Description</th><th></th></tr></thead><tbody>' +
+    entries.map(e =>
+      '<tr><td>' + e.cidr + '</td><td style="color:#888;font-size:.8rem">' + (e.description || '') + '</td>' +
+      '<td style="text-align:right"><button class="btn-sm" onclick="deleteEntry(\'' + e.cidr + '\')">Delete</button></td></tr>'
+    ).join('') + '</tbody></table>';
+}
+
+function showOverlay() { document.getElementById('overlay').style.display = 'flex'; }
+function hideOverlay() { document.getElementById('overlay').style.display = 'none'; }
 
 async function updateWhitelist() {
   const btn = document.getElementById('update-btn');
   const result = document.getElementById('result');
   btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span>Updating…';
+  btn.style.opacity = '.4';
   result.className = '';
   result.style.display = 'none';
+  showOverlay();
   try {
     const data = await apiFetch('/update', { method: 'POST' });
     result.textContent = data.results.map(r => r.region + ' (' + r.account + '): ' + r.status).join('\n');
     result.className = 'result-ok';
     await fetchStatus();
   } catch (e) {
-    result.textContent = 'Update failed: ' + e.message;
+    result.textContent = 'Add failed: ' + e.message;
     result.className = 'result-err';
   } finally {
-    btn.disabled = false;
-    btn.textContent = 'Update Whitelist';
+    hideOverlay();
+    btn.innerHTML = 'Add';
+  }
+}
+
+async function deleteEntry(cidr) {
+  if (!confirm('Delete ' + cidr + ' from all regions?')) return;
+  showOverlay();
+  try {
+    await apiFetch('/entries', { method: 'DELETE', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({cidr}) });
+    await fetchStatus();
+  } catch (e) {
+    alert('Delete failed: ' + e.message);
+  } finally {
+    hideOverlay();
   }
 }
 
