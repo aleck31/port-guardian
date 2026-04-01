@@ -6,8 +6,9 @@ Port Guardian provides a web UI where authenticated users can view their current
 
 ## Features
 
-- **Web UI** — Login, view IP & whitelist status, one-click update
+- **Web UI** — Login, view IP & whitelist status, one-click update, entries management
 - **IP info** — Shows ISP, CIDR block, range and country via RDAP
+- **Whitelist entries** — View and delete prefix list entries directly from the UI
 - **Multi-account** — Primary account (direct) + secondary account (STS AssumeRole)
 - **Multi-region** — Concurrent updates across all targets with ThreadPoolExecutor
 - **RDAP prefix lookup** — Whitelists ISP allocation block (e.g. /18) instead of /32, reducing churn
@@ -106,8 +107,9 @@ To use a custom domain instead of the default API Gateway URL:
 | GET | `/` | No | HTML web UI |
 | GET | `/ip` | No | Returns `{"ip": "x.x.x.x"}` |
 | GET | `/ipinfo` | Yes | IP details: org, CIDR, range, country (via RDAP) |
-| GET | `/status` | Yes | IP status across all regions + ports |
+| GET | `/status` | Yes | IP status across all regions + ports + entries |
 | POST | `/update` | Yes | Add IP to all prefix lists |
+| DELETE | `/entries` | Yes | Remove a CIDR from all prefix lists |
 
 ## Security
 

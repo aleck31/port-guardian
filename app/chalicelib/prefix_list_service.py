@@ -24,7 +24,7 @@ _sts_cache: dict = {}
 
 
 # ---------------------------------------------------------------------------
-# T-3.1  EC2 client factory
+# EC2 client factory
 # ---------------------------------------------------------------------------
 
 def _get_cached_credentials(role_arn):
@@ -136,7 +136,7 @@ def get_ip_info(ip):
 
 
 # ---------------------------------------------------------------------------
-# T-3.2  Prefix List operations
+# Prefix List operations
 # ---------------------------------------------------------------------------
 
 def get_prefix_list_id(ec2_client):
@@ -163,9 +163,13 @@ def check_ip_in_prefix_list(ec2_client, prefix_list_id, ip):
 
 
 def _parse_entry_timestamp(description):
-    """Parse ISO timestamp from description, or return datetime.min."""
+    """Parse ISO timestamp from description '[Guard] XX YYYY-...' or legacy 'port-guardian YYYY-...'."""
     try:
-        ts_str = description.split(DESCRIPTION_PREFIX, 1)[1].strip()
+        # New format: [Guard] CC 2026-03-20T06:08:00Z
+        if description.startswith('[Guard]'):
+            ts_str = description.rsplit(' ', 1)[-1]
+        else:
+            ts_str = description.split(DESCRIPTION_PREFIX, 1)[1].strip()
         return datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
     except Exception:
         return datetime.min
@@ -176,8 +180,11 @@ def add_ip_to_prefix_list(ec2_client, prefix_list_id, ip):
     if check_ip_in_prefix_list(ec2_client, prefix_list_id, ip):
         return 'already_exists'
 
-    cidr = get_bgp_prefix(ip)
-    description = f'{DESCRIPTION_PREFIX} {datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")}'
+    rdap = _fetch_rdap(ip)
+    cidr = _rdap_cidr(rdap, ip)
+    country = (rdap or {}).get('country', 'unknown') or 'unknown'
+    ts = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    description = f'[Guard] {country} {ts}'
 
     resp = ec2_client.describe_managed_prefix_lists(
         PrefixListIds=[prefix_list_id]
@@ -207,3 +214,23 @@ def add_ip_to_prefix_list(ec2_client, prefix_list_id, ip):
 
     ec2_client.modify_managed_prefix_list(**modify_args)
     return 'added'
+
+
+def get_all_entries(ec2_client, prefix_list_id):
+    """Return all entries in the prefix list."""
+    entries = []
+    paginator = ec2_client.get_paginator('get_managed_prefix_list_entries')
+    for page in paginator.paginate(PrefixListId=prefix_list_id):
+        entries.extend(page.get('Entries', []))
+    return entries
+
+
+def remove_cidr_from_prefix_list(ec2_client, prefix_list_id, cidr):
+    """Remove a CIDR entry from the prefix list."""
+    resp = ec2_client.describe_managed_prefix_lists(PrefixListIds=[prefix_list_id])
+    version = resp['PrefixLists'][0]['Version']
+    ec2_client.modify_managed_prefix_list(
+        PrefixListId=prefix_list_id,
+        CurrentVersion=version,
+        RemoveEntries=[{'Cidr': cidr}],
+    )

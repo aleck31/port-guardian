@@ -1,10 +1,11 @@
+import ipaddress
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from chalice import Chalice, CognitoUserPoolAuthorizer, Response
 
-from chalicelib.prefix_list_service import get_ec2_client, get_prefix_list_id, check_ip_in_prefix_list, add_ip_to_prefix_list, get_ip_info
+from chalicelib.prefix_list_service import get_ec2_client, get_prefix_list_id, check_ip_in_prefix_list, add_ip_to_prefix_list, get_ip_info, get_all_entries, remove_cidr_from_prefix_list
 
 app = Chalice(app_name='port-guardian')
 
@@ -47,7 +48,7 @@ def _get_targets():
 
 
 # ---------------------------------------------------------------------------
-# T-3.3  GET / — HTML page
+# GET / — HTML page
 # ---------------------------------------------------------------------------
 
 @app.route('/', methods=['GET'])
@@ -64,7 +65,7 @@ def index():
 
 
 # ---------------------------------------------------------------------------
-# T-3.4  GET /ip — fast public IP lookup
+# GET /ip — fast public IP lookup
 # ---------------------------------------------------------------------------
 
 @app.route('/ip', methods=['GET'])
@@ -82,7 +83,7 @@ def ipinfo():
 
 
 # ---------------------------------------------------------------------------
-# T-3.4  GET /status
+# GET /status
 # ---------------------------------------------------------------------------
 
 @app.route('/status', methods=['GET'], authorizer=authorizer)
@@ -95,24 +96,41 @@ def status():
         try:
             ec2 = get_ec2_client(account_id, region)
             pl_id = get_prefix_list_id(ec2)
-            in_pl = check_ip_in_prefix_list(ec2, pl_id, ip) if pl_id else False
+            if pl_id:
+                all_entries = get_all_entries(ec2, pl_id)
+                addr = ipaddress.ip_address(ip)
+                in_pl = any(addr in ipaddress.ip_network(e['Cidr'], strict=False) for e in all_entries)
+            else:
+                all_entries, in_pl = [], False
         except Exception as e:
             app.log.error(f'Error checking {account_id}/{region}: {e}')
-            in_pl = False
-        return {'account': account_id, 'region': region, 'in_prefix_list': in_pl}
+            all_entries, in_pl = [], False
+        return {'account': account_id, 'region': region, 'in_prefix_list': in_pl, 'entries': all_entries}
 
     with ThreadPoolExecutor(max_workers=6) as pool:
         try:
             regions = list(pool.map(_check, targets, timeout=15))
         except TimeoutError:
             app.log.error('Status check timed out')
-            regions = [{'account': a, 'region': r, 'in_prefix_list': False} for a, r in targets]
+            regions = [{'account': a, 'region': r, 'in_prefix_list': False, 'entries': []} for a, r in targets]
 
-    return {'current_ip': ip, 'ports': [int(p) for p in os.environ.get('TARGET_PORTS', '').split(',') if p], 'regions': regions}
+    # Deduplicate entries across all regions (use first occurrence)
+    seen = {}
+    for r in regions:
+        for e in r.get('entries', []):
+            if e['Cidr'] not in seen:
+                seen[e['Cidr']] = e.get('Description', '')
+
+    return {
+        'current_ip': ip,
+        'ports': [int(p) for p in os.environ.get('TARGET_PORTS', '').split(',') if p],
+        'regions': [{k: v for k, v in r.items() if k != 'entries'} for r in regions],
+        'entries': [{'cidr': c, 'description': d} for c, d in sorted(seen.items())],
+    }
 
 
 # ---------------------------------------------------------------------------
-# T-3.5  POST /update
+# POST /update
 # ---------------------------------------------------------------------------
 
 @app.route('/update', methods=['POST'], authorizer=authorizer)
@@ -142,3 +160,38 @@ def update():
             results = [{'account': a, 'region': r, 'status': 'error: timeout'} for a, r in targets]
 
     return {'ip': ip, 'results': results}
+
+
+# ---------------------------------------------------------------------------
+# DELETE /entries — remove a CIDR from all prefix lists
+# ---------------------------------------------------------------------------
+
+@app.route('/entries', methods=['DELETE'], authorizer=authorizer)
+def delete_entry():
+    body = app.current_request.json_body or {}
+    cidr = body.get('cidr', '').strip()
+    if not cidr:
+        return Response(body='{"error":"cidr required"}', status_code=400,
+                        headers={'Content-Type': 'application/json'})
+    targets = _get_targets()
+
+    def _remove(target):
+        account_id, region = target
+        try:
+            ec2 = get_ec2_client(account_id, region)
+            pl_id = get_prefix_list_id(ec2)
+            if pl_id:
+                remove_cidr_from_prefix_list(ec2, pl_id, cidr)
+            s = 'removed'
+        except Exception as e:
+            app.log.error(f'Error removing {cidr} from {account_id}/{region}: {e}')
+            s = f'error: {e}'
+        return {'account': account_id, 'region': region, 'status': s}
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        try:
+            results = list(pool.map(_remove, targets, timeout=15))
+        except TimeoutError:
+            results = [{'account': a, 'region': r, 'status': 'error: timeout'} for a, r in targets]
+
+    return {'cidr': cidr, 'results': results}
