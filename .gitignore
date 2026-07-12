@@ -11,5 +11,3 @@ app/.chalice/*
 .python-version
 config.yaml
 .dev
-
-

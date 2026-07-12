@@ -87,13 +87,14 @@ input:focus{outline:none;border-color:#0066cc}
           </tbody>
         </table>
       </div>
-      <div id="ports-info" style="font-size:.85rem;color:#888;margin-top:1rem">Whitelisted ports: 22, 3389</div>
+      <div id="ports-info" style="font-size:.85rem;color:#888;margin-top:1rem">Ports are managed per security group via its <code>port-guardian</code> tag (e.g. <code>port-guardian=22,8443</code>).</div>
     </div>
     <div class="card">
       <h2>Whitelist Entries<span id="entries-count" style="color:#999;font-weight:400"></span></h2>
       <div id="entries-body" style="margin-top:.75rem;font-size:.85rem;color:#999">Loading…</div>
     </div>
-    <div style="text-align:center;padding:.5rem">
+    <div style="display:flex;justify-content:space-between;align-items:center;padding:.5rem">
+      <span style="color:#bbb;font-size:.75rem">Version: v{{VERSION}}</span>
       <button style="background:none;border:none;color:#999;font-size:.8rem;cursor:pointer" onclick="logout()">Sign out</button>
     </div>
   </div>
@@ -262,9 +263,6 @@ const PRIMARY = '222829864634', SECONDARY = '565521294060';
 async function fetchStatus() {
   try {
     const data = await apiFetch('/status');
-    if (data.ports && data.ports.length) {
-      document.getElementById('ports-info').textContent = 'Whitelisted ports: ' + data.ports.join(', ');
-    }
     // Derive unique accounts and regions from response
     const accounts = [...new Set(data.regions.map(r => r.account))];
     const regions = [...new Set(data.regions.map(r => r.region))];

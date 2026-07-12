@@ -1,6 +1,6 @@
 [project]
 name = "port-guardian"
-version = "0.3.2"
+version = "0.3.3"
 description = "Serverless IP whitelist manager for EC2 management ports across multi-account, multi-region AWS environments."
 requires-python = ">=3.13"
 dependencies = [

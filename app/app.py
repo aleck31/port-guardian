@@ -59,7 +59,7 @@ def index():
         html
         .replace('{{COGNITO_ENDPOINT}}', f'https://cognito-idp.{cognito_region}.amazonaws.com/')
         .replace('{{COGNITO_CLIENT_ID}}', os.environ.get('COGNITO_CLIENT_ID', ''))
-        # .replace('{{API_BASE}}', _get_api_base())
+        .replace('{{VERSION}}', os.environ.get('APP_VERSION', 'dev'))
     )
     return Response(body=html, status_code=200, headers={'Content-Type': 'text/html'})
 
@@ -123,7 +123,6 @@ def status():
 
     return {
         'current_ip': ip,
-        'ports': [int(p) for p in os.environ.get('TARGET_PORTS', '').split(',') if p],
         'regions': [{k: v for k, v in r.items() if k != 'entries'} for r in regions],
         'entries': [{'cidr': c, 'description': d} for c, d in sorted(seen.items())],
     }

@@ -4,10 +4,12 @@ Usage:
   python setup.py              Deploy chalice app (syncs config.yaml → config.json)
   python setup.py --sync-sg    Deploy + sync SG ingress rules
   python setup.py --init       Deploy + IAM role + prefix lists + SG sync
+  --profile NAME               AWS profile for the primary account (default: default creds)
 """
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -38,8 +40,13 @@ def load_config():
 # EC2 client helpers
 # ---------------------------------------------------------------------------
 
+# Primary-account profile; None → default credentials. Set from --profile in main().
+PRIMARY_PROFILE = None
+
+
 def ec2_client_primary(region):
-    return boto3.client('ec2', region_name=region)
+    session = boto3.Session(profile_name=PRIMARY_PROFILE) if PRIMARY_PROFILE else boto3
+    return session.client('ec2', region_name=region)
 
 
 def ec2_client_secondary(region, role_arn):
@@ -113,16 +120,25 @@ def sync_chalice_config(cfg):
         import shutil
         shutil.copy(str(config_path) + '.example', config_path)
     chalice_cfg = json.loads(config_path.read_text())
-    env = chalice_cfg['stages']['prod']['environment_variables']
-    env['PRIMARY_ACCOUNT_ID'] = cfg['accounts']['primary']['id']
-    env['SECONDARY_ACCOUNT_ID'] = cfg['accounts']['secondary']['id']
-    env['TARGET_ROLE_ARN'] = cfg['accounts']['secondary']['role_arn']
-    env['COGNITO_USER_POOL_ID'] = cfg['cognito']['user_pool_id']
-    env['COGNITO_CLIENT_ID'] = cfg['cognito']['client_id']
-    env['COGNITO_REGION'] = cfg['cognito']['region']
-    env['TARGET_REGIONS'] = ','.join(cfg['accounts']['primary']['regions'])
-    env['TARGET_PORTS'] = ','.join(str(p) for p in cfg.get('target_ports', [22, 3389]))
+    # Rebuild env wholesale so removed keys don't linger from prior deploys.
+    chalice_cfg['stages']['prod']['environment_variables'] = {
+        'PRIMARY_ACCOUNT_ID': cfg['accounts']['primary']['id'],
+        'SECONDARY_ACCOUNT_ID': cfg['accounts']['secondary']['id'],
+        'TARGET_ROLE_ARN': cfg['accounts']['secondary']['role_arn'],
+        'COGNITO_USER_POOL_ID': cfg['cognito']['user_pool_id'],
+        'COGNITO_CLIENT_ID': cfg['cognito']['client_id'],
+        'COGNITO_REGION': cfg['cognito']['region'],
+        'TARGET_REGIONS': ','.join(cfg['accounts']['primary']['regions']),
+        'APP_VERSION': _project_version(),
+    }
     config_path.write_text(json.dumps(chalice_cfg, indent=2) + '\n')
+
+
+def _project_version():
+    """Read version from pyproject.toml (single source of truth)."""
+    text = (Path(__file__).resolve().parent / 'pyproject.toml').read_text()
+    m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
+    return m.group(1) if m else 'dev'
 
 
 
@@ -213,10 +229,43 @@ def ensure_prefix_list(ec2, account_id, region, cfg):
 # SG sync
 # ---------------------------------------------------------------------------
 
+def _parse_tag_ports(value, default_ports):
+    """Parse a port-guardian tag value into a set of ports.
+
+    'enabled'/'true'/empty → default_ports (legacy/bootstrap); '22,8443' → {22, 8443}.
+    """
+    value = (value or '').strip().lower()
+    if value in ('', 'enabled', 'true'):
+        return set(default_ports)
+    ports = set()
+    for part in value.split(','):
+        part = part.strip()
+        if part.isdigit():
+            ports.add(int(part))
+    return ports
+
+
+def _pl_ports_in_sg(sg, pl_id):
+    """Return {port: rule} for TCP ingress rules in sg that reference pl_id."""
+    out = {}
+    for rule in sg.get('IpPermissions', []):
+        if rule.get('IpProtocol') != 'tcp':
+            continue
+        if any(p['PrefixListId'] == pl_id for p in rule.get('PrefixListIds', [])):
+            out[rule.get('FromPort')] = rule
+    return out
+
+
 def sync_sg_rules(cfg):
+    """Reconcile SG ingress against the port-guardian tag — the single source of truth.
+
+    Tag VALUE carries the ports (e.g. 'port-guardian=22,8443'). Desired ports per SG
+    come from the tag; a SG with no tag has an empty desired set. For every SG that
+    references our PL: add missing ports, revoke extra ones. No tag → all its PL rules
+    are revoked (that IS the exit path). Rules referencing other PLs are never touched.
+    """
     tag_key = cfg['target_tag']['key']
-    tag_value = cfg['target_tag']['value']
-    ports = cfg.get('target_ports', [22, 3389])
+    default_ports = cfg.get('target_ports', [22, 3389])
 
     for account_id, region, ec2 in get_all_ec2_clients(cfg):
         pl_id = find_prefix_list(ec2)
@@ -226,51 +275,32 @@ def sync_sg_rules(cfg):
 
         print(f'  {account_id}/{region} (prefix list {pl_id}):')
 
-        # --- Add rules to tagged SGs ---
-        tagged_sgs = ec2.describe_security_groups(
-            Filters=[{'Name': f'tag:{tag_key}', 'Values': [tag_value]}]
-        ).get('SecurityGroups', [])
+        # Desired state: SGs carrying the tag → ports from the tag value.
+        desired = {}
+        for sg in ec2.describe_security_groups(
+            Filters=[{'Name': f'tag-key', 'Values': [tag_key]}]
+        ).get('SecurityGroups', []):
+            tag_val = next((t['Value'] for t in sg.get('Tags', []) if t['Key'] == tag_key), '')
+            desired[sg['GroupId']] = _parse_tag_ports(tag_val, default_ports)
 
-        tagged_sg_ids = {sg['GroupId'] for sg in tagged_sgs}
+        # Actual state: every SG that currently references our PL (union with desired).
+        actual = {
+            sg['GroupId']: sg
+            for sg in ec2.describe_security_groups(
+                Filters=[{'Name': 'ip-permission.prefix-list-id', 'Values': [pl_id]}]
+            ).get('SecurityGroups', [])
+        }
 
-        for sg in tagged_sgs:
-            sg_id = sg['GroupId']
-            # Remove stale port rules (ports referencing our PL but no longer in config)
-            for rule in sg.get('IpPermissions', []):
-                if rule.get('IpProtocol') != 'tcp':
-                    continue
-                rule_port = rule.get('FromPort')
-                matching_pls = [p for p in rule.get('PrefixListIds', []) if p['PrefixListId'] == pl_id]
-                if matching_pls and rule_port not in ports:
-                    ec2.revoke_security_group_ingress(
-                        GroupId=sg_id,
-                        IpPermissions=[{
-                            'IpProtocol': 'tcp',
-                            'FromPort': rule_port,
-                            'ToPort': rule.get('ToPort', rule_port),
-                            'PrefixListIds': matching_pls,
-                        }],
-                    )
-                    print(f'    {sg_id} port {rule_port} ← {pl_id} — removed (not in config)')
-            # Add missing port rules
-            for port in ports:
-                has_rule = any(
-                    r.get('IpProtocol') == 'tcp'
-                    and r.get('FromPort') == port
-                    and r.get('ToPort') == port
-                    and any(p['PrefixListId'] == pl_id for p in r.get('PrefixListIds', []))
-                    for r in sg.get('IpPermissions', [])
-                )
-                if has_rule:
-                    print(f'    {sg_id} port {port} ← {pl_id} — exists')
-                    continue
+        for sg_id in sorted(set(desired) | set(actual)):
+            want = desired.get(sg_id, set())  # no tag → exit → empty
+            have = _pl_ports_in_sg(actual[sg_id], pl_id) if sg_id in actual else {}
+
+            for port in sorted(want - set(have)):
                 try:
                     ec2.authorize_security_group_ingress(
                         GroupId=sg_id,
                         IpPermissions=[{
-                            'IpProtocol': 'tcp',
-                            'FromPort': port,
-                            'ToPort': port,
+                            'IpProtocol': 'tcp', 'FromPort': port, 'ToPort': port,
                             'PrefixListIds': [{'PrefixListId': pl_id, 'Description': 'port-guardian'}],
                         }],
                     )
@@ -278,32 +308,21 @@ def sync_sg_rules(cfg):
                 except Exception as e:
                     print(f'    {sg_id} port {port} ← {pl_id} — ERROR: {e}')
 
-        # --- Remove stale rules from untagged SGs ---
-        # Find all SGs that reference our prefix list in ingress
-        all_sgs_with_pl = ec2.describe_security_groups(
-            Filters=[{'Name': 'ip-permission.prefix-list-id', 'Values': [pl_id]}]
-        ).get('SecurityGroups', [])
-
-        for sg in all_sgs_with_pl:
-            sg_id = sg['GroupId']
-            if sg_id in tagged_sg_ids:
-                continue
-            # Build list of rules to revoke (only those referencing our prefix list)
-            rules_to_revoke = []
-            for rule in sg.get('IpPermissions', []):
-                matching_pls = [p for p in rule.get('PrefixListIds', []) if p['PrefixListId'] == pl_id]
-                if matching_pls:
-                    rules_to_revoke.append({
-                        'IpProtocol': rule['IpProtocol'],
-                        'FromPort': rule.get('FromPort', -1),
-                        'ToPort': rule.get('ToPort', -1),
-                        'PrefixListIds': matching_pls,
-                    })
-            if rules_to_revoke:
+            for port in sorted(set(have) - want):
+                rule = have[port]
                 ec2.revoke_security_group_ingress(
-                    GroupId=sg_id, IpPermissions=rules_to_revoke,
+                    GroupId=sg_id,
+                    IpPermissions=[{
+                        'IpProtocol': 'tcp', 'FromPort': port,
+                        'ToPort': rule.get('ToPort', port),
+                        'PrefixListIds': [{'PrefixListId': pl_id}],
+                    }],
                 )
-                print(f'    {sg_id} — removed {len(rules_to_revoke)} stale rule(s)')
+                reason = 'exit (no tag)' if not want else 'not in tag'
+                print(f'    {sg_id} port {port} ← {pl_id} — removed ({reason})')
+
+            for port in sorted(want & set(have)):
+                print(f'    {sg_id} port {port} ← {pl_id} — exists')
 
 
 
@@ -316,7 +335,11 @@ def main():
     group = parser.add_mutually_exclusive_group()
     group.add_argument('--init', action='store_true', help='Full init: deploy + IAM + prefix lists + SG sync')
     group.add_argument('--sync-sg', action='store_true', help='Sync SG ingress rules')
+    parser.add_argument('--profile', help='AWS profile for the primary account (default: default credentials)')
     args = parser.parse_args()
+
+    global PRIMARY_PROFILE
+    PRIMARY_PROFILE = args.profile
 
     cfg = load_config()
     sync_chalice_config(cfg)

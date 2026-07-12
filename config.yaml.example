@@ -20,10 +20,13 @@ cognito:
   user_pool_id: ap-southeast-1_XXXXXXXXX
   client_id: xxxxxxxxxxxxxxxxxxxxxxxxx
 
+# SG management is driven by this tag. Its VALUE carries the ports per SG,
+# e.g. `port-guardian=22,8443`. Add/remove ports or unmanage a SG by editing the tag.
 target_tag:
   key: port-guardian
-  value: enabled
 
+# Fallback ports only for a legacy bare tag value (`enabled`/empty). New SGs
+# should always set explicit ports in the tag value instead.
 target_ports:
   - 22
   - 3389

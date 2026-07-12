@@ -14,6 +14,7 @@ Port Guardian provides a web UI where authenticated users can view their current
 - **RDAP prefix lookup** — Whitelists ISP allocation block (e.g. /18) instead of /32, reducing churn
 - **CIDR containment** — Checks if IP falls within any existing prefix, not just exact match
 - **FIFO eviction** — Auto-removes oldest entry when prefix list is full
+- **Tag-driven SG sync** — A `port-guardian=<ports>` tag on a Security Group is the single source of truth for which ports it opens; sync reconciles rules to match, and removing the tag unmanages the SG
 - **Cognito auth** — API endpoints protected by Cognito User Pool authorizer
 
 ## Architecture
@@ -82,15 +83,21 @@ uv run setup.py
 # Full init: deploy + IAM role + prefix lists + SG rule sync
 uv run setup.py --init
 
-# Deploy + sync SG ingress rules (e.g. after changing target_ports)
+# Deploy + sync SG ingress rules (run after adding/changing a port-guardian tag)
 uv run setup.py --sync-sg
+
+# Use a named AWS profile for the primary account (defaults to default credentials)
+uv run setup.py --sync-sg --profile myprofile
 ```
 
 | Flag | What it does |
 |------|-------------|
 | (none) | Sync config + deploy Chalice app |
 | `--init` | + create IAM role, prefix lists, sync SG rules |
-| `--sync-sg` | + re-sync SG ingress rules to match config |
+| `--sync-sg` | + reconcile SG ingress rules to each SG's `port-guardian` tag |
+| `--profile NAME` | AWS profile for the primary account (default: default credentials) |
+
+Manage which ports a Security Group opens by setting its `port-guardian` tag value, e.g. `port-guardian=22,8443`. Running `--sync-sg` reconciles that SG's ingress rules to the tag; removing the tag revokes the rules on the next sync.
 
 ### Custom Domain (Optional)
 
@@ -107,7 +114,7 @@ To use a custom domain instead of the default API Gateway URL:
 | GET | `/` | No | HTML web UI |
 | GET | `/ip` | No | Returns `{"ip": "x.x.x.x"}` |
 | GET | `/ipinfo` | Yes | IP details: org, CIDR, range, country (via RDAP) |
-| GET | `/status` | Yes | IP status across all regions + ports + entries |
+| GET | `/status` | Yes | IP status across all regions + entries |
 | POST | `/update` | Yes | Add IP to all prefix lists |
 | DELETE | `/entries` | Yes | Remove a CIDR from all prefix lists |
 
