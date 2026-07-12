@@ -7,7 +7,7 @@ and prefix list lookup / check / add operations.
 import ipaddress
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import boto3
 import requests
@@ -170,9 +170,12 @@ def _parse_entry_timestamp(description):
             ts_str = description.rsplit(' ', 1)[-1]
         else:
             ts_str = description.split(DESCRIPTION_PREFIX, 1)[1].strip()
-        return datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+        dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+        # Force aware UTC — date-only strings (e.g. '2026-03-24') parse as naive.
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except Exception:
-        return datetime.min
+        # aware sentinel so min() never mixes naive/aware in the FIFO path
+        return datetime.min.replace(tzinfo=timezone.utc)
 
 
 def add_ip_to_prefix_list(ec2_client, prefix_list_id, ip):
@@ -183,7 +186,7 @@ def add_ip_to_prefix_list(ec2_client, prefix_list_id, ip):
     rdap = _fetch_rdap(ip)
     cidr = _rdap_cidr(rdap, ip)
     country = (rdap or {}).get('country', 'unknown') or 'unknown'
-    ts = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     description = f'[Guard] {country} {ts}'
 
     resp = ec2_client.describe_managed_prefix_lists(

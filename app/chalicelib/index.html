@@ -8,7 +8,8 @@
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;color:#1a1a2e;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:1rem}
-.container{width:100%;max-width:660px}
+.container{width:100%;max-width:660px;margin:0 auto}
+@media(min-width:768px){.container{max-width:780px}}
 header{text-align:center;padding:1.5rem 0 1rem}
 header h1{font-size:1.5rem}
 header p{color:#666;font-size:.875rem;margin-top:.25rem}
@@ -89,7 +90,7 @@ input:focus{outline:none;border-color:#0066cc}
       <div id="ports-info" style="font-size:.85rem;color:#888;margin-top:1rem">Whitelisted ports: 22, 3389</div>
     </div>
     <div class="card">
-      <h2>Whitelist Entries</h2>
+      <h2>Whitelist Entries<span id="entries-count" style="color:#999;font-weight:400"></span></h2>
       <div id="entries-body" style="margin-top:.75rem;font-size:.85rem;color:#999">Loading…</div>
     </div>
     <div style="text-align:center;padding:.5rem">
@@ -290,14 +291,37 @@ async function fetchStatus() {
   }
 }
 
+// Split a raw entry description into {when, label}: pull out the ISO timestamp,
+// leave the human-readable remainder (country / marker) as the label.
+function parseEntryDesc(desc) {
+  desc = desc || '';
+  const m = desc.match(/(\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?Z?)?)/);
+  let when = '';
+  if (m) {
+    const d = new Date(m[1].replace(' ', 'T').replace(/Z?$/, 'Z'));
+    if (!isNaN(d)) when = d.toLocaleString(undefined, {year:'numeric',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+  }
+  const label = desc
+    .replace(/^\[Guard\]\s*/, '').replace(/^port-guardian\s*/, '')
+    .replace(/\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?Z?)?/, '')
+    .replace(/\s+/g, ' ').trim();
+  return { when, label };
+}
+
 function renderEntries(entries) {
   const body = document.getElementById('entries-body');
+  const count = document.getElementById('entries-count');
+  if (count) count.textContent = entries.length ? ' (' + entries.length + ')' : '';
   if (!entries.length) { body.textContent = 'No entries'; return; }
-  body.innerHTML = '<table style="width:100%"><thead><tr><th>CIDR</th><th>Description</th><th></th></tr></thead><tbody>' +
-    entries.map(e =>
-      '<tr><td>' + e.cidr + '</td><td style="color:#888;font-size:.8rem">' + (e.description || '') + '</td>' +
-      '<td style="text-align:right"><button class="btn-sm" onclick="deleteEntry(\'' + e.cidr + '\')">Delete</button></td></tr>'
-    ).join('') + '</tbody></table>';
+  const esc = s => (s || '').replace(/</g, '&lt;');
+  body.innerHTML = '<table style="width:100%"><thead><tr><th>CIDR</th><th>Added</th><th>Description</th><th></th></tr></thead><tbody>' +
+    entries.map(e => {
+      const p = parseEntryDesc(e.description);
+      return '<tr><td>' + esc(e.cidr) + '</td>' +
+        '<td style="color:#888;font-size:.8rem;white-space:nowrap">' + (p.when || '—') + '</td>' +
+        '<td style="color:#888;font-size:.8rem">' + esc(p.label) + '</td>' +
+        '<td style="text-align:right"><button class="btn-sm" onclick="deleteEntry(\'' + e.cidr + '\')">Delete</button></td></tr>';
+    }).join('') + '</tbody></table>';
 }
 
 function showOverlay() { document.getElementById('overlay').style.display = 'flex'; }
@@ -313,8 +337,11 @@ async function updateWhitelist() {
   showOverlay();
   try {
     const data = await apiFetch('/update', { method: 'POST' });
-    result.textContent = data.results.map(r => r.region + ' (' + r.account + '): ' + r.status).join('\n');
-    result.className = 'result-ok';
+    const failed = data.results.filter(r => String(r.status).startsWith('error'));
+    result.textContent = data.results.map(r =>
+      (String(r.status).startsWith('error') ? '✗ ' : '✓ ') + r.region + ' (' + r.account + '): ' + r.status
+    ).join('\n');
+    result.className = failed.length ? 'result-err' : 'result-ok';
     await fetchStatus();
   } catch (e) {
     result.textContent = 'Add failed: ' + e.message;
