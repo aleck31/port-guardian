@@ -31,6 +31,8 @@ target_ports:
   - 22
   - 3389
 
+# FIFO eviction threshold (MAX_ENTRIES env) and MaxEntries for newly created PLs.
+# Keep ≤ the real PL MaxEntries — if larger, adds fail with a mismatch error.
 max_entries: 20
 
 lambda:

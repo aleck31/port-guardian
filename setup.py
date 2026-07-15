@@ -129,6 +129,7 @@ def sync_chalice_config(cfg):
         'COGNITO_CLIENT_ID': cfg['cognito']['client_id'],
         'COGNITO_REGION': cfg['cognito']['region'],
         'TARGET_REGIONS': ','.join(cfg['accounts']['primary']['regions']),
+        'MAX_ENTRIES': str(cfg.get('max_entries', 20)),
         'APP_VERSION': _project_version(),
     }
     config_path.write_text(json.dumps(chalice_cfg, indent=2) + '\n')

@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import boto3
 import requests
 from botocore.config import Config
+from botocore.exceptions import ClientError
 
 _BOTO_CFG = Config(connect_timeout=5, read_timeout=8, retries={"max_attempts": 1})
 
@@ -178,8 +179,23 @@ def _parse_entry_timestamp(description):
         return datetime.min.replace(tzinfo=timezone.utc)
 
 
+# Eviction threshold learned from AWS after a config-vs-MaxEntries mismatch: {pl_id: real MaxEntries}
+_max_entries_override: dict = {}
+
+
+def _eviction_threshold(prefix_list_id):
+    """Configured max_entries (MAX_ENTRIES env), unless a real-MaxEntries override was learned."""
+    configured = int(os.environ.get('MAX_ENTRIES', '20'))
+    return _max_entries_override.get(prefix_list_id, configured)
+
+
 def add_ip_to_prefix_list(ec2_client, prefix_list_id, ip):
-    """Add BGP prefix for ip to the prefix list with FIFO eviction."""
+    """Add BGP prefix for ip to the prefix list with FIFO eviction.
+
+    Eviction triggers at the CONFIGURED threshold (decoupled from the PL's real
+    MaxEntries). If config exceeds the real capacity and the add fails, learn the
+    real value for subsequent calls and raise a clear error for this one.
+    """
     if check_ip_in_prefix_list(ec2_client, prefix_list_id, ip):
         return 'already_exists'
 
@@ -194,7 +210,7 @@ def add_ip_to_prefix_list(ec2_client, prefix_list_id, ip):
     )
     pl = resp['PrefixLists'][0]
     version = pl['Version']
-    max_entries = pl['MaxEntries']
+    threshold = _eviction_threshold(prefix_list_id)
 
     # Count current entries
     entries = []
@@ -208,14 +224,26 @@ def add_ip_to_prefix_list(ec2_client, prefix_list_id, ip):
         'AddEntries': [{'Cidr': cidr, 'Description': description}],
     }
 
-    if len(entries) >= max_entries:
+    if len(entries) >= threshold:
         oldest = min(
             entries,
             key=lambda e: _parse_entry_timestamp(e.get('Description', '')),
         )
         modify_args['RemoveEntries'] = [{'Cidr': oldest['Cidr']}]
 
-    ec2_client.modify_managed_prefix_list(**modify_args)
+    try:
+        ec2_client.modify_managed_prefix_list(**modify_args)
+    except ClientError:
+        real_max = pl['MaxEntries']
+        if 'RemoveEntries' not in modify_args and len(entries) >= real_max:
+            # Config said there was room but the PL is actually full: learn the real
+            # capacity so the next add evicts correctly, and surface the mismatch.
+            _max_entries_override[prefix_list_id] = real_max
+            raise ValueError(
+                f'max_entries config ({threshold}) exceeds prefix list MaxEntries '
+                f'({real_max}); now using {real_max} — retry the add'
+            )
+        raise
     return 'added'
 
 
