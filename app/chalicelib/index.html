@@ -297,7 +297,12 @@ function parseEntryDesc(desc) {
   let when = '';
   if (m) {
     const d = new Date(m[1].replace(' ', 'T').replace(/Z?$/, 'Z'));
-    if (!isNaN(d)) when = d.toLocaleString(undefined, {year:'numeric',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+    // Fixed local-time format YYYY-MM-DD HH:mm, independent of browser locale
+    if (!isNaN(d)) {
+      const p2 = n => String(n).padStart(2, '0');
+      when = d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate()) +
+             ' ' + p2(d.getHours()) + ':' + p2(d.getMinutes());
+    }
   }
   const label = desc
     .replace(/^\[Guard\]\s*/, '').replace(/^port-guardian\s*/, '')
@@ -306,20 +311,35 @@ function parseEntryDesc(desc) {
   return { when, label };
 }
 
+let _entries = [], _timeSortDir = 0; // 0 = server order, -1 = newest first, 1 = oldest first
+
+function sortEntriesByTime() {
+  _timeSortDir = _timeSortDir === -1 ? 1 : -1;
+  renderEntries(_entries);
+}
+
 function renderEntries(entries) {
+  _entries = entries;
   const body = document.getElementById('entries-body');
   const count = document.getElementById('entries-count');
   if (count) count.textContent = entries.length ? ' (' + entries.length + ')' : '';
   if (!entries.length) { body.textContent = 'No entries'; return; }
   const esc = s => (s || '').replace(/</g, '&lt;');
-  body.innerHTML = '<table style="width:100%"><thead><tr><th>CIDR</th><th>Added</th><th>Description</th><th></th></tr></thead><tbody>' +
-    entries.map(e => {
-      const p = parseEntryDesc(e.description);
-      return '<tr><td>' + esc(e.cidr) + '</td>' +
+  let rows = entries.map(e => ({ e, p: parseEntryDesc(e.description) }));
+  if (_timeSortDir) {
+    // `when` is YYYY-MM-DD HH:mm, so string compare == chronological; undated entries always last
+    rows.sort((a, b) => !a.p.when - !b.p.when || _timeSortDir * a.p.when.localeCompare(b.p.when));
+  }
+  const arrow = _timeSortDir === -1 ? ' ▼' : _timeSortDir === 1 ? ' ▲' : '';
+  body.innerHTML = '<table style="width:100%"><thead><tr><th>CIDR</th>' +
+    '<th style="cursor:pointer;user-select:none" onclick="sortEntriesByTime()" title="Sort by time">Added At' + arrow + '</th>' +
+    '<th>Description</th><th></th></tr></thead><tbody>' +
+    rows.map(({ e, p }) =>
+      '<tr><td>' + esc(e.cidr) + '</td>' +
         '<td style="color:#888;font-size:.8rem;white-space:nowrap">' + (p.when || '—') + '</td>' +
         '<td style="color:#888;font-size:.8rem">' + esc(p.label) + '</td>' +
-        '<td style="text-align:right"><button class="btn-sm" onclick="deleteEntry(\'' + e.cidr + '\')">Delete</button></td></tr>';
-    }).join('') + '</tbody></table>';
+        '<td style="text-align:right"><button class="btn-sm" onclick="deleteEntry(\'' + e.cidr + '\')">Delete</button></td></tr>'
+    ).join('') + '</tbody></table>';
 }
 
 function showOverlay() { document.getElementById('overlay').style.display = 'flex'; }
