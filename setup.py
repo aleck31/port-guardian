@@ -151,12 +151,11 @@ def ensure_target_role(cfg, lambda_role_arn):
     secondary = cfg['accounts']['secondary']
     iam = boto3.Session(profile_name='lab').client('iam')
 
+    role_exists = True
     try:
         iam.get_role(RoleName=ROLE_NAME)
-        print(f'  IAM role {ROLE_NAME} already exists — skipped')
-        return
     except iam.exceptions.NoSuchEntityException:
-        pass
+        role_exists = False
 
     trust_policy = {
         'Version': '2012-10-17',
@@ -185,22 +184,39 @@ def ensure_target_role(cfg, lambda_role_arn):
             {
                 'Sid': 'PrefixListDescribe',
                 'Effect': 'Allow',
-                'Action': 'ec2:DescribeManagedPrefixLists',
+                'Action': [
+                    'ec2:DescribeManagedPrefixLists',
+                    'ec2:DescribeSecurityGroups',
+                ],
                 'Resource': '*',
+            },
+            {
+                'Sid': 'SgRulesTaggedOnly',
+                'Effect': 'Allow',
+                'Action': [
+                    'ec2:AuthorizeSecurityGroupIngress',
+                    'ec2:RevokeSecurityGroupIngress',
+                ],
+                'Resource': f"arn:aws:ec2:*:{secondary['id']}:security-group/*",
+                'Condition': {
+                    'Null': {'aws:ResourceTag/port-guardian': 'false'}
+                },
             },
         ],
     }
 
-    iam.create_role(
-        RoleName=ROLE_NAME,
-        AssumeRolePolicyDocument=json.dumps(trust_policy),
-        Description='Port Guardian cross-account prefix list access',
-    )
+    if not role_exists:
+        iam.create_role(
+            RoleName=ROLE_NAME,
+            AssumeRolePolicyDocument=json.dumps(trust_policy),
+            Description='Port Guardian cross-account prefix list access',
+        )
+    # Always refresh the inline policy so permission additions propagate to existing roles.
     iam.put_role_policy(
         RoleName=ROLE_NAME, PolicyName=POLICY_NAME,
         PolicyDocument=json.dumps(permissions_policy),
     )
-    print(f'  Created IAM role {ROLE_NAME}')
+    print(f'  IAM role {ROLE_NAME} {"created" if not role_exists else "policy refreshed"}')
 
 
 def ensure_prefix_list(ec2, account_id, region, cfg):
@@ -230,41 +246,11 @@ def ensure_prefix_list(ec2, account_id, region, cfg):
 # SG sync
 # ---------------------------------------------------------------------------
 
-def _parse_tag_ports(value, default_ports):
-    """Parse a port-guardian tag value into a set of ports.
-
-    'enabled'/'true'/empty → default_ports (legacy/bootstrap); '22,8443' → {22, 8443}.
-    """
-    value = (value or '').strip().lower()
-    if value in ('', 'enabled', 'true'):
-        return set(default_ports)
-    ports = set()
-    for part in value.split(','):
-        part = part.strip()
-        if part.isdigit():
-            ports.add(int(part))
-    return ports
-
-
-def _pl_ports_in_sg(sg, pl_id):
-    """Return {port: rule} for TCP ingress rules in sg that reference pl_id."""
-    out = {}
-    for rule in sg.get('IpPermissions', []):
-        if rule.get('IpProtocol') != 'tcp':
-            continue
-        if any(p['PrefixListId'] == pl_id for p in rule.get('PrefixListIds', [])):
-            out[rule.get('FromPort')] = rule
-    return out
-
-
 def sync_sg_rules(cfg):
-    """Reconcile SG ingress against the port-guardian tag — the single source of truth.
+    """Reconcile SG ingress against the port-guardian tag (see chalicelib.sg_sync_service)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent / 'app'))
+    from chalicelib.sg_sync_service import reconcile_sg_rules
 
-    Tag VALUE carries the ports (e.g. 'port-guardian=22,8443'). Desired ports per SG
-    come from the tag; a SG with no tag has an empty desired set. For every SG that
-    references our PL: add missing ports, revoke extra ones. No tag → all its PL rules
-    are revoked (that IS the exit path). Rules referencing other PLs are never touched.
-    """
     tag_key = cfg['target_tag']['key']
     default_ports = cfg.get('target_ports', [22, 3389])
 
@@ -273,57 +259,10 @@ def sync_sg_rules(cfg):
         if not pl_id:
             print(f'  {account_id}/{region}: no prefix list found — skipping')
             continue
-
         print(f'  {account_id}/{region} (prefix list {pl_id}):')
-
-        # Desired state: SGs carrying the tag → ports from the tag value.
-        desired = {}
-        for sg in ec2.describe_security_groups(
-            Filters=[{'Name': f'tag-key', 'Values': [tag_key]}]
-        ).get('SecurityGroups', []):
-            tag_val = next((t['Value'] for t in sg.get('Tags', []) if t['Key'] == tag_key), '')
-            desired[sg['GroupId']] = _parse_tag_ports(tag_val, default_ports)
-
-        # Actual state: every SG that currently references our PL (union with desired).
-        actual = {
-            sg['GroupId']: sg
-            for sg in ec2.describe_security_groups(
-                Filters=[{'Name': 'ip-permission.prefix-list-id', 'Values': [pl_id]}]
-            ).get('SecurityGroups', [])
-        }
-
-        for sg_id in sorted(set(desired) | set(actual)):
-            want = desired.get(sg_id, set())  # no tag → exit → empty
-            have = _pl_ports_in_sg(actual[sg_id], pl_id) if sg_id in actual else {}
-
-            for port in sorted(want - set(have)):
-                try:
-                    ec2.authorize_security_group_ingress(
-                        GroupId=sg_id,
-                        IpPermissions=[{
-                            'IpProtocol': 'tcp', 'FromPort': port, 'ToPort': port,
-                            'PrefixListIds': [{'PrefixListId': pl_id, 'Description': 'port-guardian'}],
-                        }],
-                    )
-                    print(f'    {sg_id} port {port} ← {pl_id} — added')
-                except Exception as e:
-                    print(f'    {sg_id} port {port} ← {pl_id} — ERROR: {e}')
-
-            for port in sorted(set(have) - want):
-                rule = have[port]
-                ec2.revoke_security_group_ingress(
-                    GroupId=sg_id,
-                    IpPermissions=[{
-                        'IpProtocol': 'tcp', 'FromPort': port,
-                        'ToPort': rule.get('ToPort', port),
-                        'PrefixListIds': [{'PrefixListId': pl_id}],
-                    }],
-                )
-                reason = 'exit (no tag)' if not want else 'not in tag'
-                print(f'    {sg_id} port {port} ← {pl_id} — removed ({reason})')
-
-            for port in sorted(want & set(have)):
-                print(f'    {sg_id} port {port} ← {pl_id} — exists')
+        for a in reconcile_sg_rules(ec2, pl_id, tag_key, default_ports):
+            port = a["port"] if a["port"] is not None else '-'
+            print(f'    {a["sg_id"]} port {port} ← {pl_id} — {a["action"]}')
 
 
 

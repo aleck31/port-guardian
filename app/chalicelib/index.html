@@ -45,6 +45,20 @@ input:focus{outline:none;border-color:#0066cc}
 </head>
 <body>
 <div id="overlay"><span class="spinner"></span></div>
+<div id="sg-modal" style="position:fixed;inset:0;background:rgba(0,0,0,.4);display:none;align-items:center;justify-content:center;z-index:998" onclick="if(event.target===this)closeSgModal()">
+  <div style="background:#fff;border-radius:12px;max-width:720px;width:92%;max-height:80vh;overflow-y:auto;padding:1.5rem">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.25rem">
+      <h2 style="margin:0">Managed Security Groups</h2>
+      <button class="btn-sm" style="background:#9ca3af" onclick="closeSgModal()">Close</button>
+    </div>
+    <div style="font-size:.8rem;color:#888;margin-bottom:.75rem">🟢 rules match tag · ⚪ out of sync (missing or extra rules)</div>
+    <div id="sg-modal-body" style="font-size:.85rem;color:#666">Loading…</div>
+    <div style="margin-top:1rem;display:flex;align-items:center;gap:.75rem">
+      <button id="sync-sg-btn" class="btn-sm" style="background:#3b82f6;padding:.45rem 1rem;font-size:.85rem" onclick="runSyncSg()">Sync Now</button>
+      <span id="sync-sg-note" style="font-size:.8rem;color:#888"></span>
+    </div>
+  </div>
+</div>
 <div class="container">
   <header>
     <h1>🛡️ Port Guardian</h1>
@@ -87,7 +101,7 @@ input:focus{outline:none;border-color:#0066cc}
           </tbody>
         </table>
       </div>
-      <div id="ports-info" style="font-size:.85rem;color:#888;margin-top:1rem">Ports are managed per security group via its <code>port-guardian</code> tag (e.g. <code>port-guardian=22,8443</code>).</div>
+      <div id="ports-info" style="font-size:.85rem;color:#888;margin-top:1rem"><button class="btn-sm" style="background:#3b82f6;margin-right:.5rem" onclick="openSgModal()">Security Groups</button>Ports are managed per security group via its <code>port-guardian</code> tag (e.g. <code>port-guardian=22,8443</code>).</div>
     </div>
     <div class="card">
       <h2>Whitelist Entries<span id="entries-count" style="color:#999;font-weight:400"></span></h2>
@@ -344,6 +358,65 @@ function renderEntries(entries) {
 
 function showOverlay() { document.getElementById('overlay').style.display = 'flex'; }
 function hideOverlay() { document.getElementById('overlay').style.display = 'none'; }
+
+// --- Managed SG modal ---
+function openSgModal() {
+  document.getElementById('sg-modal').style.display = 'flex';
+  document.getElementById('sync-sg-note').textContent = '';
+  loadSgs();
+}
+function closeSgModal() { document.getElementById('sg-modal').style.display = 'none'; }
+
+function renderSgTargets(targets, actionsMode) {
+  const esc = s => String(s == null ? '' : s).replace(/</g, '&lt;');
+  return targets.map(t => {
+    const head = '<div style="margin:.75rem 0 .25rem;font-weight:600;color:#444">' +
+      esc(t.account) + ' / ' + esc(t.region) + '</div>';
+    if (t.error) return head + '<div style="color:#ef4444">Error: ' + esc(t.error) + '</div>';
+    if (!t.sgs.length) return head + '<div style="color:#999">No managed SGs</div>';
+    if (actionsMode) {
+      // sync results: one line per action
+      return head + '<div>' + t.sgs.map(a =>
+        '<div>' + esc(a.sg_id) + (a.port != null ? ' port ' + a.port : '') + ' — ' +
+        (String(a.action).startsWith('error') ? '<span style="color:#ef4444">' + esc(a.action) + '</span>'
+          : String(a.action) === 'exists' ? '<span style="color:#999">exists</span>'
+          : '<b>' + esc(a.action) + '</b>') + '</div>').join('') + '</div>';
+    }
+    return head + '<table style="width:100%"><thead><tr><th></th><th>SG</th><th>Name</th><th>Tag ports</th><th>Actual rules</th></tr></thead><tbody>' +
+      t.sgs.map(s =>
+        '<tr><td>' + (s.in_sync ? '🟢' : '⚪') + '</td>' +
+        '<td style="white-space:nowrap">' + esc(s.sg_id) + '</td>' +
+        '<td>' + esc(s.name) + '</td>' +
+        '<td>' + (s.want ? esc(s.want.join(', ')) : '<span style="color:#f59e0b">' + esc(s.tag) + '?</span>') + '</td>' +
+        '<td>' + (s.have.length ? esc(s.have.join(', ')) : '—') + '</td></tr>').join('') +
+      '</tbody></table>';
+  }).join('');
+}
+
+async function loadSgs() {
+  const body = document.getElementById('sg-modal-body');
+  body.textContent = 'Loading…';
+  try {
+    const data = await apiFetch('/sgs');
+    body.innerHTML = renderSgTargets(data.targets, false);
+  } catch (e) { body.innerHTML = '<span style="color:#ef4444">Error: ' + e.message + '</span>'; }
+}
+
+async function runSyncSg() {
+  if (!confirm('Reconcile all SG rules to match their port-guardian tags?\nRules not covered by a tag will be REMOVED.')) return;
+  const btn = document.getElementById('sync-sg-btn'), note = document.getElementById('sync-sg-note');
+  btn.disabled = true; note.textContent = 'Syncing…';
+  try {
+    const data = await apiFetch('/sync-sg', { method: 'POST' });
+    const acts = data.targets.flatMap(t => t.sgs || []);
+    const changed = acts.filter(a => a.action === 'added' || a.action === 'removed').length;
+    const errors = acts.filter(a => String(a.action).startsWith('error')).length +
+                   data.targets.filter(t => t.error).length;
+    note.textContent = 'Done: ' + changed + ' change(s)' + (errors ? ', ' + errors + ' error(s)' : '');
+    document.getElementById('sg-modal-body').innerHTML = renderSgTargets(data.targets, true);
+  } catch (e) { note.textContent = 'Failed: ' + e.message; }
+  finally { btn.disabled = false; }
+}
 
 async function updateWhitelist() {
   const btn = document.getElementById('update-btn');

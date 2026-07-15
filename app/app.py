@@ -6,6 +6,7 @@ from pathlib import Path
 from chalice import Chalice, CognitoUserPoolAuthorizer, Response
 
 from chalicelib.prefix_list_service import get_ec2_client, get_prefix_list_id, check_ip_in_prefix_list, add_ip_to_prefix_list, get_ip_info, get_all_entries, remove_cidr_from_prefix_list
+from chalicelib.sg_sync_service import list_managed_sgs, reconcile_sg_rules
 
 app = Chalice(app_name='port-guardian')
 
@@ -159,6 +160,45 @@ def update():
             results = [{'account': a, 'region': r, 'status': 'error: timeout'} for a, r in targets]
 
     return {'ip': ip, 'results': results}
+
+
+# ---------------------------------------------------------------------------
+# GET /sgs — managed SG overview; POST /sync-sg — tag-driven reconcile
+# ---------------------------------------------------------------------------
+
+TAG_KEY = 'port-guardian'
+
+
+def _fanout_sg(fn):
+    """Run fn(ec2, pl_id, account, region) across all targets; collect per-target results."""
+    def _one(target):
+        account_id, region = target
+        try:
+            ec2 = get_ec2_client(account_id, region)
+            pl_id = get_prefix_list_id(ec2)
+            if not pl_id:
+                return {'account': account_id, 'region': region, 'error': 'prefix list not found', 'sgs': []}
+            return {'account': account_id, 'region': region, 'sgs': fn(ec2, pl_id)}
+        except Exception as e:
+            app.log.error(f'SG op failed for {account_id}/{region}: {e}')
+            return {'account': account_id, 'region': region, 'error': str(e), 'sgs': []}
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        try:
+            return list(pool.map(_one, _get_targets(), timeout=25))
+        except TimeoutError:
+            app.log.error('SG operation timed out')
+            return [{'account': a, 'region': r, 'error': 'timeout', 'sgs': []} for a, r in _get_targets()]
+
+
+@app.route('/sgs', methods=['GET'], authorizer=authorizer)
+def sgs():
+    return {'targets': _fanout_sg(lambda ec2, pl_id: list_managed_sgs(ec2, pl_id, TAG_KEY))}
+
+
+@app.route('/sync-sg', methods=['POST'], authorizer=authorizer)
+def sync_sg():
+    return {'targets': _fanout_sg(lambda ec2, pl_id: reconcile_sg_rules(ec2, pl_id, TAG_KEY))}
 
 
 # ---------------------------------------------------------------------------
