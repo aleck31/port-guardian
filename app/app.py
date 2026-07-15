@@ -198,7 +198,12 @@ def sgs():
 
 @app.route('/sync-sg', methods=['POST'], authorizer=authorizer)
 def sync_sg():
-    return {'targets': _fanout_sg(lambda ec2, pl_id: reconcile_sg_rules(ec2, pl_id, TAG_KEY))}
+    body = app.current_request.json_body or {}
+    allow_exit = bool(body.get('allow_exit'))
+    dry_run = bool(body.get('dry_run'))
+    return {'targets': _fanout_sg(
+        lambda ec2, pl_id: reconcile_sg_rules(ec2, pl_id, TAG_KEY, allow_exit=allow_exit, dry_run=dry_run)
+    )}
 
 
 # ---------------------------------------------------------------------------

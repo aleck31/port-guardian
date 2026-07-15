@@ -37,17 +37,23 @@ def pl_ports_in_sg(sg, pl_id):
     return out
 
 
-def _collect_sgs(ec2, pl_id, tag_key):
-    """Return {sg_id: sg} for every SG that carries the tag OR references the PL."""
+def _collect_sgs(ec2, pl_id, tag_key, tagged_only=False):
+    """Return {sg_id: sg} for SGs to consider.
+
+    tagged_only: only SGs carrying the tag (cheap — for the overview). Otherwise also
+    include SGs whose ingress references the PL (the PL-id filter is the slow query),
+    so exit candidates — tag wiped but rule still present — surface for reconcile.
+    """
     sgs = {}
     for sg in ec2.describe_security_groups(
         Filters=[{'Name': 'tag-key', 'Values': [tag_key]}]
     ).get('SecurityGroups', []):
         sgs[sg['GroupId']] = sg
-    for sg in ec2.describe_security_groups(
-        Filters=[{'Name': 'ip-permission.prefix-list-id', 'Values': [pl_id]}]
-    ).get('SecurityGroups', []):
-        sgs.setdefault(sg['GroupId'], sg)
+    if not tagged_only:
+        for sg in ec2.describe_security_groups(
+            Filters=[{'Name': 'ip-permission.prefix-list-id', 'Values': [pl_id]}]
+        ).get('SecurityGroups', []):
+            sgs.setdefault(sg['GroupId'], sg)
     return sgs
 
 
@@ -60,9 +66,9 @@ def _sg_state(sg, pl_id, tag_key, default_ports=None):
 
 
 def list_managed_sgs(ec2, pl_id, tag_key, default_ports=None):
-    """Status of every tagged or PL-referencing SG, for display. No mutations."""
+    """Overview of tagged SGs only (cheap, no PL-id scan). No mutations."""
     out = []
-    for sg_id, sg in sorted(_collect_sgs(ec2, pl_id, tag_key).items()):
+    for sg_id, sg in sorted(_collect_sgs(ec2, pl_id, tag_key, tagged_only=True).items()):
         tag_val, want, have = _sg_state(sg, pl_id, tag_key, default_ports)
         out.append({
             'sg_id': sg_id,
@@ -75,14 +81,55 @@ def list_managed_sgs(ec2, pl_id, tag_key, default_ports=None):
     return out
 
 
-def reconcile_sg_rules(ec2, pl_id, tag_key, default_ports=None):
+def reconcile_sg_rules(ec2, pl_id, tag_key, default_ports=None, allow_exit=False, dry_run=False):
     """Reconcile every SG's PL-referencing rules against its tag. Returns actions.
 
     Each action: {sg_id, name, port, action} where action is added/removed/exists/
-    skipped/error:<msg>. SGs whose desired state is undeterminable (legacy tag, no
-    default) are skipped — never revoked on a guess.
+    skipped/would_add/would_remove/would_remove_exit/error:<msg>. SGs whose desired
+    state is undeterminable (legacy tag, no default) are skipped — never touched.
+
+    dry_run=True computes the plan without calling AWS (would_add/would_remove/...).
+    This is also the query that does the slow PL-id scan for exit candidates, so the
+    cheap tagged-only overview stays fast.
+
+    Untagged SGs are the exit path, but a missing tag can also mean an IaC run wiped
+    it (that once took down a live ALB), so exit revokes run only with allow_exit=True.
+    Removals driven by an explicit tag value (port dropped, or 'none'/'off') are normal.
     """
     actions = []
+
+    def _add(sg_id, name, port):
+        if dry_run:
+            return {'sg_id': sg_id, 'name': name, 'port': port, 'action': 'would_add'}
+        try:
+            ec2.authorize_security_group_ingress(
+                GroupId=sg_id,
+                IpPermissions=[{
+                    'IpProtocol': 'tcp', 'FromPort': port, 'ToPort': port,
+                    'PrefixListIds': [{'PrefixListId': pl_id, 'Description': 'port-guardian'}],
+                }],
+            )
+            return {'sg_id': sg_id, 'name': name, 'port': port, 'action': 'added'}
+        except Exception as e:
+            return {'sg_id': sg_id, 'name': name, 'port': port, 'action': f'error: {e}'}
+
+    def _remove(sg_id, name, port, rule, exit_path):
+        label = 'would_remove_exit' if exit_path else 'would_remove'
+        if dry_run:
+            return {'sg_id': sg_id, 'name': name, 'port': port, 'action': label}
+        try:
+            ec2.revoke_security_group_ingress(
+                GroupId=sg_id,
+                IpPermissions=[{
+                    'IpProtocol': 'tcp', 'FromPort': port,
+                    'ToPort': rule.get('ToPort', port),
+                    'PrefixListIds': [{'PrefixListId': pl_id}],
+                }],
+            )
+            return {'sg_id': sg_id, 'name': name, 'port': port, 'action': 'removed'}
+        except Exception as e:
+            return {'sg_id': sg_id, 'name': name, 'port': port, 'action': f'error: {e}'}
+
     for sg_id, sg in sorted(_collect_sgs(ec2, pl_id, tag_key).items()):
         name = sg.get('GroupName', '')
         tag_val, want, have = _sg_state(sg, pl_id, tag_key, default_ports)
@@ -91,34 +138,17 @@ def reconcile_sg_rules(ec2, pl_id, tag_key, default_ports=None):
                             'action': f'skipped (unparseable tag: {tag_val!r})'})
             continue
 
+        is_exit = tag_val is None
+        if is_exit and not allow_exit:
+            # Report only; never revoke an exit candidate without explicit confirmation.
+            for port in sorted(have):
+                actions.append({'sg_id': sg_id, 'name': name, 'port': port, 'action': 'would_remove_exit'})
+            continue
+
         for port in sorted(want - set(have)):
-            try:
-                ec2.authorize_security_group_ingress(
-                    GroupId=sg_id,
-                    IpPermissions=[{
-                        'IpProtocol': 'tcp', 'FromPort': port, 'ToPort': port,
-                        'PrefixListIds': [{'PrefixListId': pl_id, 'Description': 'port-guardian'}],
-                    }],
-                )
-                actions.append({'sg_id': sg_id, 'name': name, 'port': port, 'action': 'added'})
-            except Exception as e:
-                actions.append({'sg_id': sg_id, 'name': name, 'port': port, 'action': f'error: {e}'})
-
+            actions.append(_add(sg_id, name, port))
         for port in sorted(set(have) - want):
-            rule = have[port]
-            try:
-                ec2.revoke_security_group_ingress(
-                    GroupId=sg_id,
-                    IpPermissions=[{
-                        'IpProtocol': 'tcp', 'FromPort': port,
-                        'ToPort': rule.get('ToPort', port),
-                        'PrefixListIds': [{'PrefixListId': pl_id}],
-                    }],
-                )
-                actions.append({'sg_id': sg_id, 'name': name, 'port': port, 'action': 'removed'})
-            except Exception as e:
-                actions.append({'sg_id': sg_id, 'name': name, 'port': port, 'action': f'error: {e}'})
-
+            actions.append(_remove(sg_id, name, port, have[port], is_exit))
         for port in sorted(want & set(have)):
             actions.append({'sg_id': sg_id, 'name': name, 'port': port, 'action': 'exists'})
     return actions

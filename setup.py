@@ -44,9 +44,12 @@ def load_config():
 PRIMARY_PROFILE = None
 
 
+def primary_session():
+    return boto3.Session(profile_name=PRIMARY_PROFILE) if PRIMARY_PROFILE else boto3
+
+
 def ec2_client_primary(region):
-    session = boto3.Session(profile_name=PRIMARY_PROFILE) if PRIMARY_PROFILE else boto3
-    return session.client('ec2', region_name=region)
+    return primary_session().client('ec2', region_name=region)
 
 
 def ec2_client_secondary(region, role_arn):
@@ -111,6 +114,20 @@ def chalice_deploy():
     print(f'\n  API URL:  {api_url or "not found"}')
     print(f'  Role ARN: {role_arn or "not found"}')
     return role_arn, api_url
+
+
+def bounce_lambda(cfg):
+    """Force a Lambda container roll so it drops cached STS creds and re-assumes the
+    target role with the latest permissions. Needed after an IAM policy change, since
+    deploy alone won't roll the container when the function config is unchanged."""
+    region = cfg.get('lambda', {}).get('deploy_region', 'ap-southeast-1')
+    fn = 'port-guardian-prod'
+    lam = primary_session().client('lambda', region_name=region)
+    env = lam.get_function_configuration(FunctionName=fn).get('Environment', {}).get('Variables', {})
+    env['STS_CACHE_BUST'] = str(int(env.get('STS_CACHE_BUST', '0')) + 1)
+    lam.update_function_configuration(FunctionName=fn, Environment={'Variables': env})
+    lam.get_waiter('function_updated').wait(FunctionName=fn)
+    print(f'  Lambda {fn} bounced (STS_CACHE_BUST={env["STS_CACHE_BUST"]})')
 
 
 def sync_chalice_config(cfg):
@@ -191,16 +208,21 @@ def ensure_target_role(cfg, lambda_role_arn):
                 'Resource': '*',
             },
             {
-                'Sid': 'SgRulesTaggedOnly',
+                'Sid': 'SgAuthorizeTaggedOnly',
                 'Effect': 'Allow',
-                'Action': [
-                    'ec2:AuthorizeSecurityGroupIngress',
-                    'ec2:RevokeSecurityGroupIngress',
-                ],
+                'Action': 'ec2:AuthorizeSecurityGroupIngress',
                 'Resource': f"arn:aws:ec2:*:{secondary['id']}:security-group/*",
                 'Condition': {
                     'Null': {'aws:ResourceTag/port-guardian': 'false'}
                 },
+            },
+            {
+                # Revoke needs no tag condition: the exit path removes rules from SGs
+                # whose tag is already gone. Code only revokes rules referencing our PL.
+                'Sid': 'SgRevokeAnySg',
+                'Effect': 'Allow',
+                'Action': 'ec2:RevokeSecurityGroupIngress',
+                'Resource': f"arn:aws:ec2:*:{secondary['id']}:security-group/*",
             },
         ],
     }
@@ -211,12 +233,25 @@ def ensure_target_role(cfg, lambda_role_arn):
             AssumeRolePolicyDocument=json.dumps(trust_policy),
             Description='Port Guardian cross-account prefix list access',
         )
-    # Always refresh the inline policy so permission additions propagate to existing roles.
+    # Detect whether the inline policy actually changes before refreshing it, so callers
+    # can skip the (slow) Lambda container bounce when permissions are unchanged.
+    try:
+        current = iam.get_role_policy(RoleName=ROLE_NAME, PolicyName=POLICY_NAME)['PolicyDocument']
+    except iam.exceptions.NoSuchEntityException:
+        current = None
+    changed = current != permissions_policy
     iam.put_role_policy(
         RoleName=ROLE_NAME, PolicyName=POLICY_NAME,
         PolicyDocument=json.dumps(permissions_policy),
     )
-    print(f'  IAM role {ROLE_NAME} {"created" if not role_exists else "policy refreshed"}')
+    if not role_exists:
+        state = 'created'
+    elif changed:
+        state = 'policy updated'
+    else:
+        state = 'policy unchanged'
+    print(f'  IAM role {ROLE_NAME} {state}')
+    return changed or not role_exists
 
 
 def ensure_prefix_list(ec2, account_id, region, cfg):
@@ -246,13 +281,14 @@ def ensure_prefix_list(ec2, account_id, region, cfg):
 # SG sync
 # ---------------------------------------------------------------------------
 
-def sync_sg_rules(cfg):
+def sync_sg_rules(cfg, allow_exit=False):
     """Reconcile SG ingress against the port-guardian tag (see chalicelib.sg_sync_service)."""
     sys.path.insert(0, str(Path(__file__).resolve().parent / 'app'))
     from chalicelib.sg_sync_service import reconcile_sg_rules
 
     tag_key = cfg['target_tag']['key']
     default_ports = cfg.get('target_ports', [22, 3389])
+    pending_exits = 0
 
     for account_id, region, ec2 in get_all_ec2_clients(cfg):
         pl_id = find_prefix_list(ec2)
@@ -260,9 +296,15 @@ def sync_sg_rules(cfg):
             print(f'  {account_id}/{region}: no prefix list found — skipping')
             continue
         print(f'  {account_id}/{region} (prefix list {pl_id}):')
-        for a in reconcile_sg_rules(ec2, pl_id, tag_key, default_ports):
+        for a in reconcile_sg_rules(ec2, pl_id, tag_key, default_ports, allow_exit=allow_exit):
             port = a["port"] if a["port"] is not None else '-'
             print(f'    {a["sg_id"]} port {port} ← {pl_id} — {a["action"]}')
+            if a['action'].startswith('would_remove'):
+                pending_exits += 1
+
+    if pending_exits:
+        print(f'\n  {pending_exits} rule(s) on untagged SGs NOT removed. Verify the tags were '
+              f'meant to be gone (IaC runs can wipe them), then re-run with --allow-exit.')
 
 
 
@@ -275,6 +317,8 @@ def main():
     group = parser.add_mutually_exclusive_group()
     group.add_argument('--init', action='store_true', help='Full init: deploy + IAM + prefix lists + SG sync')
     group.add_argument('--sync-sg', action='store_true', help='Sync SG ingress rules')
+    parser.add_argument('--allow-exit', action='store_true',
+                        help='Allow sync to revoke rules on untagged SGs (exit path); default only reports them')
     parser.add_argument('--profile', help='AWS profile for the primary account (default: default credentials)')
     args = parser.parse_args()
 
@@ -301,12 +345,18 @@ def main():
         role_arn, _ = chalice_deploy()
         print()
 
+    iam_changed = False
     if 'iam' in steps:
         step += 1
         print(f'[{step}/{total}] Ensuring IAM target role in secondary account...')
         if not role_arn:
             sys.exit('Could not parse Lambda role ARN from chalice deploy output')
-        ensure_target_role(cfg, role_arn)
+        iam_changed = ensure_target_role(cfg, role_arn)
+        # IAM change lands after deploy, so the running Lambda still holds STS creds
+        # signed under the old policy — bounce it before sync uses those creds.
+        if iam_changed:
+            print('  IAM permissions changed — bouncing Lambda to refresh cross-account creds...')
+            bounce_lambda(cfg)
         print()
 
     if 'prefix_lists' in steps:
@@ -319,7 +369,7 @@ def main():
     if 'sync_sg' in steps:
         step += 1
         print(f'[{step}/{total}] Syncing Security Group rules...')
-        sync_sg_rules(cfg)
+        sync_sg_rules(cfg, allow_exit=args.allow_exit)
         print()
 
     print('Done.')
