@@ -117,6 +117,14 @@ def get_bgp_prefix(ip):
     return _rdap_cidr(_fetch_rdap(ip), ip)
 
 
+def _rdap_org(data):
+    """Extract the ISP/org name from RDAP remarks, or '' if absent."""
+    for r in (data or {}).get("remarks", []):
+        if r.get("title") == "description" and r.get("description"):
+            return r["description"][0]
+    return ""
+
+
 def get_ip_info(ip):
     """Return IP info dict from RDAP: org, network name, country, range, cidr."""
     data = _fetch_rdap(ip)
@@ -129,10 +137,9 @@ def get_ip_info(ip):
     end = data.get("endAddress", "")
     if start and end:
         info["range"] = f"{start} - {end}"
-    for r in data.get("remarks", []):
-        if r.get("title") == "description" and r.get("description"):
-            info["org"] = r["description"][0]
-            break
+    org = _rdap_org(data)
+    if org:
+        info["org"] = org
     return info
 
 
@@ -161,6 +168,14 @@ def check_ip_in_prefix_list(ec2_client, prefix_list_id, ip):
             if addr in ipaddress.ip_network(entry['Cidr'], strict=False):
                 return True
     return False
+
+
+PIN_MARKER = '[PIN]'
+
+
+def is_pinned(description):
+    """A pinned entry (description contains [PIN]) is never FIFO-evicted."""
+    return PIN_MARKER in (description or '')
 
 
 def _parse_entry_timestamp(description):
@@ -202,8 +217,9 @@ def add_ip_to_prefix_list(ec2_client, prefix_list_id, ip):
     rdap = _fetch_rdap(ip)
     cidr = _rdap_cidr(rdap, ip)
     country = (rdap or {}).get('country', 'unknown') or 'unknown'
+    isp = ' '.join(_rdap_org(rdap).split()[:2])  # e.g. 'China Mobile Peoples Telephone...' -> 'China Mobile'
     ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-    description = f'[Guard] {country} {ts}'
+    description = f'[Guard] {country} {isp} {ts}'.replace('  ', ' ')
 
     resp = ec2_client.describe_managed_prefix_lists(
         PrefixListIds=[prefix_list_id]
@@ -225,10 +241,13 @@ def add_ip_to_prefix_list(ec2_client, prefix_list_id, ip):
     }
 
     if len(entries) >= threshold:
-        oldest = min(
-            entries,
-            key=lambda e: _parse_entry_timestamp(e.get('Description', '')),
-        )
+        evictable = [e for e in entries if not is_pinned(e.get('Description', ''))]
+        if not evictable:
+            raise ValueError(
+                f'prefix list full ({len(entries)}/{threshold}) and all entries are '
+                f'pinned ([PIN]); cannot add {cidr} — unpin an entry or raise max_entries'
+            )
+        oldest = min(evictable, key=lambda e: _parse_entry_timestamp(e.get('Description', '')))
         modify_args['RemoveEntries'] = [{'Cidr': oldest['Cidr']}]
 
     try:
@@ -264,4 +283,33 @@ def remove_cidr_from_prefix_list(ec2_client, prefix_list_id, cidr):
         PrefixListId=prefix_list_id,
         CurrentVersion=version,
         RemoveEntries=[{'Cidr': cidr}],
+    )
+
+
+def set_pin(ec2_client, prefix_list_id, cidr, pinned):
+    """Add or remove the [PIN] marker on a CIDR's description.
+
+    No rename API, but AddEntries with an already-present CIDR overwrites its
+    Description in place (verified against a live prefix list) — no RemoveEntries,
+    no remove-then-add, no waiting out modify-in-progress between two calls.
+    """
+    resp = ec2_client.describe_managed_prefix_lists(PrefixListIds=[prefix_list_id])
+    pl = resp['PrefixLists'][0]
+    entries = get_all_entries(ec2_client, prefix_list_id)
+    entry = next((e for e in entries if e['Cidr'] == cidr), None)
+    if entry is None:
+        raise ValueError(f'{cidr} not found in prefix list')
+
+    desc = entry.get('Description', '')
+    if pinned and not is_pinned(desc):
+        new_desc = f'{PIN_MARKER} {desc}'.strip()
+    elif not pinned and is_pinned(desc):
+        new_desc = ' '.join(desc.replace(PIN_MARKER, '').split())
+    else:
+        return  # already in the desired state
+
+    ec2_client.modify_managed_prefix_list(
+        PrefixListId=prefix_list_id,
+        CurrentVersion=pl['Version'],
+        AddEntries=[{'Cidr': cidr, 'Description': new_desc}],
     )

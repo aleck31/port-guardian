@@ -5,7 +5,7 @@ from pathlib import Path
 
 from chalice import Chalice, CognitoUserPoolAuthorizer, Response
 
-from chalicelib.prefix_list_service import get_ec2_client, get_prefix_list_id, check_ip_in_prefix_list, add_ip_to_prefix_list, get_ip_info, get_all_entries, remove_cidr_from_prefix_list
+from chalicelib.prefix_list_service import get_ec2_client, get_prefix_list_id, check_ip_in_prefix_list, add_ip_to_prefix_list, get_ip_info, get_all_entries, remove_cidr_from_prefix_list, set_pin
 from chalicelib.sg_sync_service import list_managed_sgs, reconcile_sg_rules
 
 app = Chalice(app_name='port-guardian')
@@ -239,3 +239,39 @@ def delete_entry():
             results = [{'account': a, 'region': r, 'status': 'error: timeout'} for a, r in targets]
 
     return {'cidr': cidr, 'results': results}
+
+
+# ---------------------------------------------------------------------------
+# PATCH /entries — pin/unpin a CIDR across all prefix lists
+# ---------------------------------------------------------------------------
+
+@app.route('/entries', methods=['PATCH'], authorizer=authorizer)
+def patch_entry():
+    body = app.current_request.json_body or {}
+    cidr = body.get('cidr', '').strip()
+    pinned = bool(body.get('pinned'))
+    if not cidr:
+        return Response(body='{"error":"cidr required"}', status_code=400,
+                        headers={'Content-Type': 'application/json'})
+    targets = _get_targets()
+
+    def _pin(target):
+        account_id, region = target
+        try:
+            ec2 = get_ec2_client(account_id, region)
+            pl_id = get_prefix_list_id(ec2)
+            if pl_id:
+                set_pin(ec2, pl_id, cidr, pinned)
+            s = 'pinned' if pinned else 'unpinned'
+        except Exception as e:
+            app.log.error(f'Error setting pin={pinned} for {cidr} in {account_id}/{region}: {e}')
+            s = f'error: {e}'
+        return {'account': account_id, 'region': region, 'status': s}
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        try:
+            results = list(pool.map(_pin, targets, timeout=15))
+        except TimeoutError:
+            results = [{'account': a, 'region': r, 'status': 'error: timeout'} for a, r in targets]
+
+    return {'cidr': cidr, 'pinned': pinned, 'results': results}

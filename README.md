@@ -13,8 +13,9 @@ Port Guardian provides a web UI where authenticated users can view their current
 - **Multi-region** — Concurrent updates across all targets with ThreadPoolExecutor
 - **RDAP prefix lookup** — Whitelists ISP allocation block (e.g. /18) instead of /32, reducing churn
 - **CIDR containment** — Checks if IP falls within any existing prefix, not just exact match
-- **FIFO eviction** — Auto-removes oldest entry when prefix list is full
-- **Tag-driven SG sync** — A `port-guardian=<ports>` tag on a Security Group is the single source of truth for which ports it opens; sync reconciles rules to match, and removing the tag unmanages the SG
+- **FIFO eviction** — Auto-removes oldest entry when prefix list is full; pinned entries (see below) are never evicted
+- **Pinned entries** — Mark an entry with the pin icon in the UI to exempt it from FIFO eviction (stored as a `[PIN]` marker in its description); adding a new IP fails with a clear error if the list is full and every entry is pinned
+- **Tag-driven SG sync** — A `port-guardian=<ports>` tag on a Security Group is the single source of truth for which ports it opens. The UI's Managed SGs modal previews changes (including rules on untagged/"exit" SGs) before applying; removing the tag and confirming the exit unmanages the SG
 - **Cognito auth** — API endpoints protected by Cognito User Pool authorizer
 
 ## Architecture
@@ -44,6 +45,7 @@ Browser → API Gateway + Cognito → Lambda → Prefix Lists (multi-accounts ×
     ├── app.py              # Lambda routes (parallel execution)
     ├── chalicelib/
     │   ├── prefix_list_service.py  # EC2 client factory, prefix list ops, RDAP lookup
+    │   ├── sg_sync_service.py      # Tag-driven SG reconcile, shared by the Lambda and setup.py
     │   └── index.html              # Single-page web UI
     └── .chalice/
         ├── config.json.example     # Chalice config template (auto-generated on deploy)
@@ -117,11 +119,14 @@ To use a custom domain instead of the default API Gateway URL:
 | GET | `/status` | Yes | IP status across all regions + entries |
 | POST | `/update` | Yes | Add IP to all prefix lists |
 | DELETE | `/entries` | Yes | Remove a CIDR from all prefix lists |
+| PATCH | `/entries` | Yes | Pin/unpin a CIDR (`{"cidr": "...", "pinned": true}`) across all prefix lists |
+| GET | `/sgs` | Yes | Overview of tagged Security Groups per account/region |
+| POST | `/sync-sg` | Yes | Reconcile SG ingress to each SG's `port-guardian` tag; `{"dry_run": true}` for a preview, `{"allow_exit": true}` to also revoke rules on untagged SGs |
 
 ## Security
 
 - All mutation endpoints require Cognito authentication
-- Lambda IAM role follows least-privilege (ec2:Describe*, ec2:Modify* on prefix lists only)
+- Lambda IAM role follows least-privilege: `ec2:Describe*`/`ec2:Modify*` scoped to `ManagedBy=port-guardian`-tagged prefix lists; `AuthorizeSecurityGroupIngress` requires the `port-guardian` tag, `RevokeSecurityGroupIngress` does not (needed for the SG-sync exit path — see `.dev/CLAUDE.md`)
 - Cross-account access via scoped AssumeRole
 - Management ports only open to prefix list IPs — no 0.0.0.0/0 rules
 - boto3 clients configured with short timeouts and no retries to fail fast
