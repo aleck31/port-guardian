@@ -18,7 +18,6 @@ _BOTO_CFG = Config(connect_timeout=5, read_timeout=8, retries={"max_attempts": 1
 
 MANAGED_BY_TAG = 'port-guardian'
 PREFIX_LIST_NAME = 'port-guardian-whitelist'
-DESCRIPTION_PREFIX = 'port-guardian'
 
 # Widest block ever whitelisted: a wider RDAP allocation is clamped to this.
 WIDEST_PREFIX_LEN = 16
@@ -206,19 +205,21 @@ def is_pinned(description):
 
 
 def _parse_entry_timestamp(description):
-    """Parse ISO timestamp from description '[Guard] XX YYYY-...' or legacy 'port-guardian YYYY-...'."""
+    """Parse the trailing ISO8601 token of an entry description, for FIFO ordering.
+
+    Any leading words are tolerated, so '[Guard] CN China Mobile <ts>', the
+    '[PIN] '-prefixed variant and legacy 'port-guardian <ts>' all parse. A
+    description with no parseable token (a hand-created entry) sorts oldest and is
+    evicted first — pin anything manually added that must survive.
+    """
+    token = (description or '').rsplit(' ', 1)[-1]
     try:
-        # New format: [Guard] CC 2026-03-20T06:08:00Z
-        if description.startswith('[Guard]'):
-            ts_str = description.rsplit(' ', 1)[-1]
-        else:
-            ts_str = description.split(DESCRIPTION_PREFIX, 1)[1].strip()
-        dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
-        # Force aware UTC — date-only strings (e.g. '2026-03-24') parse as naive.
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-    except Exception:
+        dt = datetime.fromisoformat(token.replace('Z', '+00:00'))
+    except ValueError:
         # aware sentinel so min() never mixes naive/aware in the FIFO path
         return datetime.min.replace(tzinfo=timezone.utc)
+    # Force aware UTC — date-only tokens (e.g. '2026-03-24') parse as naive.
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 # Eviction threshold learned from AWS after a config-vs-MaxEntries mismatch: {pl_id: real MaxEntries}

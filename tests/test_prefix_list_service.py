@@ -1,4 +1,4 @@
-"""Regression tests for RDAP prefix selection.
+"""Regression tests for RDAP prefix selection and entry-description parsing.
 
 RDAP payloads below are trimmed captures of real responses (ARIN, 2026-09), kept
 verbatim in the fields under test so the cases stay honest: a range that
@@ -7,14 +7,17 @@ wider than the /16 clamp, and an opaque ARIN id carrying no network.
 """
 
 import ipaddress
+from datetime import datetime, timezone
 
 import pytest
 
 from chalicelib.prefix_list_service import (
     FALLBACK_PREFIX_LEN,
     WIDEST_PREFIX_LEN,
+    _parse_entry_timestamp,
     _rdap_cidr,
     get_bgp_prefix,
+    is_pinned,
 )
 
 # HKBN: 101.78.129.0 - 101.78.131.255 summarizes to [/24, /23]; the IP is in the /23.
@@ -93,3 +96,46 @@ class TestRdapCidr:
     def test_fallback_width_constant_matches_behaviour(self):
         net = ipaddress.ip_network(_rdap_cidr(None, '198.51.100.9'))
         assert net.prefixlen == FALLBACK_PREFIX_LEN
+
+
+class TestParseEntryTimestamp:
+    EXPECTED = datetime(2026, 7, 16, 4, 53, 48, tzinfo=timezone.utc)
+
+    def test_current_format_with_isp(self):
+        desc = '[Guard] CN China Mobile 2026-07-16T04:53:48Z'
+        assert _parse_entry_timestamp(desc) == self.EXPECTED
+
+    def test_current_format_without_isp(self):
+        assert _parse_entry_timestamp('[Guard] CN 2026-07-16T04:53:48Z') == self.EXPECTED
+
+    def test_pinned_entry_still_parses(self):
+        """The regression: a [PIN] prefix hid the [Guard] marker from the parser,
+        so a pinned entry read as the oldest-possible sentinel."""
+        desc = '[PIN] [Guard] CN China Mobile 2026-07-16T04:53:48Z'
+        assert _parse_entry_timestamp(desc) == self.EXPECTED
+
+    def test_legacy_format(self):
+        assert _parse_entry_timestamp('port-guardian 2026-03-20T06:08:00Z') == datetime(
+            2026, 3, 20, 6, 8, tzinfo=timezone.utc
+        )
+
+    def test_date_only_token_is_forced_to_aware_utc(self):
+        parsed = _parse_entry_timestamp('port-guardian 2026-03-24')
+        assert parsed == datetime(2026, 3, 24, tzinfo=timezone.utc)
+        assert parsed.tzinfo is not None
+
+    @pytest.mark.parametrize('desc', ['', None, 'peering link', 'no timestamp here'])
+    def test_unparseable_sorts_oldest_and_stays_aware(self, desc):
+        parsed = _parse_entry_timestamp(desc)
+        assert parsed == datetime.min.replace(tzinfo=timezone.utc)
+        assert parsed.tzinfo is not None
+
+    def test_pinned_entry_is_not_the_fifo_victim(self):
+        """Ordering check across the mixed formats a real list accumulates."""
+        entries = [
+            '[PIN] [Guard] CN China Mobile 2026-01-01T00:00:00Z',
+            '[Guard] HK 2026-07-16T04:53:48Z',
+            'port-guardian 2026-03-24',
+        ]
+        evictable = [d for d in entries if not is_pinned(d)]
+        assert min(evictable, key=_parse_entry_timestamp) == 'port-guardian 2026-03-24'
