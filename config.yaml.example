@@ -33,7 +33,17 @@ target_ports:
 
 # FIFO eviction threshold (MAX_ENTRIES env) and MaxEntries for newly created PLs.
 # Keep ≤ the real PL MaxEntries — if larger, adds fail with a mismatch error.
+# Note a SG rule referencing the PL costs its MaxEntries against the SG rule
+# quota, so raising this eats into "rules per security group" (default 60).
 max_entries: 20
+
+# Widest block a single IP may whitelist, as a prefix length. RDAP allocations are
+# often far wider (China Mobile's is ~3.5M addresses), so this clamp decides the
+# real exposure: /16 = 65,536 addresses, /20 = 4,096, /24 = 256. Cloud-hosted
+# clients ignore this and always get a /32.
+# Narrowing costs extra entries (and eviction churn), not access — a client outside
+# its block re-adds itself through the UI, which is not IP-gated.
+max_prefix_len: 16
 
 lambda:
   deploy_region: ap-southeast-1

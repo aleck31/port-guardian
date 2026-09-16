@@ -1,4 +1,5 @@
 import ipaddress
+import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -9,6 +10,8 @@ from chalicelib.prefix_list_service import get_ec2_client, get_prefix_list_id, c
 from chalicelib.sg_sync_service import list_managed_sgs, reconcile_sg_rules
 
 app = Chalice(app_name='port-guardian')
+# Chalice defaults to ERROR; the client_ip observations below are INFO.
+app.log.setLevel(logging.INFO)
 
 COGNITO_USER_POOL_ARN = (
     f"arn:aws:cognito-idp:{os.environ.get('COGNITO_REGION', 'ap-southeast-1')}:"
@@ -90,6 +93,11 @@ def ipinfo():
 @app.route('/status', methods=['GET'], authorizer=authorizer)
 def status():
     ip = _get_source_ip()
+    # The only place the raw client IP is recorded: entry descriptions keep the IP
+    # that first created a block, so they say nothing about movement *within* it.
+    # /status runs on every page load, so these lines accumulate the series needed
+    # to pick max_prefix_len from real data instead of guessing.
+    app.log.info(f'client_ip={ip}')
     targets = _get_targets()
 
     def _check(target):

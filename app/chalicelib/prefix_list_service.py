@@ -19,7 +19,7 @@ _BOTO_CFG = Config(connect_timeout=5, read_timeout=8, retries={"max_attempts": 1
 MANAGED_BY_TAG = 'port-guardian'
 PREFIX_LIST_NAME = 'port-guardian-whitelist'
 
-# Widest block ever whitelisted: a wider RDAP allocation is clamped to this.
+# Default widest block ever whitelisted; overridden by MAX_PREFIX_LEN.
 WIDEST_PREFIX_LEN = 16
 # Used when RDAP is unavailable, or its data covers the IP in no block.
 FALLBACK_PREFIX_LEN = 24
@@ -167,6 +167,19 @@ def _rdap_candidates(data):
     return []
 
 
+def _clamp_prefix_len():
+    """Widest block to whitelist, as a prefix length (MAX_PREFIX_LEN env).
+
+    Trades exposure against churn. The wide default has little to do with ISP
+    topology: allocations are often far larger than a /16 (China Mobile's is ~3.5M
+    addresses), so the clamp is an arbitrary window around wherever the client
+    happened to be — wide enough to admit strangers, not wide enough to contain a
+    moving IP. Narrowing costs extra entries, not access: a client that falls
+    outside its block re-adds itself through the UI, which is not IP-gated.
+    """
+    return int(os.environ.get('MAX_PREFIX_LEN', WIDEST_PREFIX_LEN))
+
+
 def _rdap_cidr(data, ip):
     """The block to whitelist for ip.
 
@@ -174,7 +187,7 @@ def _rdap_cidr(data, ip):
     so a wider block buys no churn resistance, while the space around it belongs to
     other tenants — a /16 there would admit tens of thousands of strangers'
     instances. Everything else uses the RDAP allocation block containing ip,
-    clamped to /16.
+    clamped to _clamp_prefix_len().
 
     An address range summarizes into one or more blocks, and only the block that
     actually holds ip is usable as a whitelist entry — the first block often is
@@ -193,8 +206,9 @@ def _rdap_cidr(data, ip):
             net = None
     if net is None:
         return str(ipaddress.ip_network(f"{ip}/{FALLBACK_PREFIX_LEN}", strict=False))
-    if net.prefixlen < WIDEST_PREFIX_LEN:
-        net = ipaddress.ip_network(f"{ip}/{WIDEST_PREFIX_LEN}", strict=False)
+    clamp = _clamp_prefix_len()
+    if net.prefixlen < clamp:
+        net = ipaddress.ip_network(f"{ip}/{clamp}", strict=False)
     return str(net)
 
 

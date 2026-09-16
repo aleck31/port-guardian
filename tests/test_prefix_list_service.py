@@ -173,6 +173,34 @@ class TestCloudHostedIp:
         assert len(calls) == 1
 
 
+class TestClampWidth:
+    """max_prefix_len decides real exposure for consumer ISPs, so it is configurable."""
+
+    def test_default_is_the_module_constant(self, monkeypatch):
+        monkeypatch.delenv('MAX_PREFIX_LEN', raising=False)
+        assert _rdap_cidr(RDAP_WIDER_THAN_CLAMP, '223.104.1.5') == '223.104.0.0/16'
+
+    @pytest.mark.parametrize('clamp, expected', [
+        ('16', '223.104.0.0/16'),
+        ('20', '223.104.0.0/20'),
+        ('24', '223.104.1.0/24'),
+    ])
+    def test_env_override_narrows_the_block(self, monkeypatch, clamp, expected):
+        monkeypatch.setenv('MAX_PREFIX_LEN', clamp)
+        assert _rdap_cidr(RDAP_WIDER_THAN_CLAMP, '223.104.1.5') == expected
+
+    def test_clamp_never_widens_an_already_narrow_allocation(self, monkeypatch):
+        """A /23 allocation stays a /23 even when the clamp allows /16."""
+        monkeypatch.setenv('MAX_PREFIX_LEN', '16')
+        assert _rdap_cidr(RDAP_MULTI_BLOCK, '101.78.130.4') == '101.78.130.0/23'
+
+    def test_narrowed_result_still_contains_the_ip(self, monkeypatch):
+        monkeypatch.setenv('MAX_PREFIX_LEN', '22')
+        net = ipaddress.ip_network(_rdap_cidr(RDAP_WIDER_THAN_CLAMP, '223.104.1.5'))
+        assert ipaddress.ip_address('223.104.1.5') in net
+        assert net.prefixlen == 22
+
+
 class TestParseEntryTimestamp:
     EXPECTED = datetime(2026, 7, 16, 4, 53, 48, tzinfo=timezone.utc)
 
