@@ -233,7 +233,10 @@ async function fetchIpInfo() {
     if (d.country) ip.innerHTML = d.ip + ' <span style="font-size:.75rem;color:#999">(' + d.country + ')</span>';
     const lines = [];
     if (d.org) lines.push(d.org);
-    if (d.cidr || d.range) lines.push([d.cidr ? 'CIDR: ' + d.cidr : '', d.range ? 'Range: ' + d.range : ''].filter(Boolean).join(' &middot; '));
+    if (d.cidr || d.range) {
+      const cidrText = d.cidr ? 'CIDR: ' + d.cidr + (addrCountLabel(d.cidr) ? ' (' + addrCountLabel(d.cidr) + ')' : '') : '';
+      lines.push([cidrText, d.range ? 'Range: ' + d.range : ''].filter(Boolean).join(' &middot; '));
+    }
     document.getElementById('ip-info').innerHTML = lines.join('<br>');
   } catch {}
 }
@@ -310,6 +313,31 @@ async function fetchStatus() {
   }
 }
 
+// A CIDR hides how much it grants: '/16' and '65,536 addresses' read very
+// differently at the moment of deciding. Returns null for anything unparseable.
+const WIDE_BLOCK_THRESHOLD = 65536;
+
+function addrCount(cidr) {
+  const len = parseInt((cidr || '').split('/')[1], 10);
+  if (!Number.isInteger(len) || len < 0 || len > 32) return null;
+  return 2 ** (32 - len);
+}
+
+function addrCountLabel(cidr) {
+  const n = addrCount(cidr);
+  if (n === null) return '';
+  return n === 1 ? '1 address' : n.toLocaleString() + ' addresses';
+}
+
+// Compact form for table cells; wide blocks are tinted to stand out in a list.
+function addrCountBadge(cidr) {
+  const n = addrCount(cidr);
+  if (n === null) return '';
+  const color = n >= WIDE_BLOCK_THRESHOLD ? '#d97706' : '#888';
+  return ' <span style="color:' + color + ';font-size:.75rem" title="' + addrCountLabel(cidr) + '">('
+    + n.toLocaleString() + ')</span>';
+}
+
 // Split a raw entry description into {when, label}: pull out the ISO timestamp,
 // leave the human-readable remainder (country / marker) as the label.
 function parseEntryDesc(desc) {
@@ -364,7 +392,7 @@ function renderEntries(entries) {
     '<th style="cursor:pointer;user-select:none" onclick="sortEntriesByTime()" title="Sort by time">Added At' + arrow + '</th>' +
     '<th>Description</th><th></th></tr></thead><tbody>' +
     rows.map(({ e, p }) =>
-      '<tr><td>' + esc(e.cidr) + (p.pinned ? ' <span title="Pinned — never auto-evicted">📌</span>' : '') + '</td>' +
+      '<tr><td>' + esc(e.cidr) + addrCountBadge(e.cidr) + (p.pinned ? ' <span title="Pinned — never auto-evicted">📌</span>' : '') + '</td>' +
         '<td style="color:#888;font-size:.8rem;white-space:nowrap">' + (p.when || '—') + '</td>' +
         '<td style="color:#888;font-size:.8rem">' + esc(p.label) + '</td>' +
         '<td style="text-align:right;white-space:nowrap">' +
