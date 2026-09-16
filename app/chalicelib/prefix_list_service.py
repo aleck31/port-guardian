@@ -23,9 +23,17 @@ PREFIX_LIST_NAME = 'port-guardian-whitelist'
 WIDEST_PREFIX_LEN = 16
 # Used when RDAP is unavailable, or its data covers the IP in no block.
 FALLBACK_PREFIX_LEN = 24
+# Used for cloud-hosted clients, whose address does not move.
+EXACT_PREFIX_LEN = 32
+
+AWS_IP_RANGES_URL = 'https://ip-ranges.amazonaws.com/ip-ranges.json'
+CLOUD_RANGES_TTL_SECONDS = 6 * 3600
 
 # Cache: {role_arn: (credentials_dict, expiry_timestamp)}
 _sts_cache: dict = {}
+
+# Cache: {'networks': [ip_network, ...], 'expires': timestamp}
+_cloud_ranges_cache: dict = {}
 
 
 # ---------------------------------------------------------------------------
@@ -97,15 +105,59 @@ def _summarize_range(start, end):
     ))
 
 
+def _cloud_networks():
+    """Published cloud provider ranges, or None if they could not be fetched.
+
+    Only AWS is consulted — it is where these clients actually run, and it
+    publishes a stable endpoint. Other providers publish equivalents if the gap
+    below ever matters. Cached for the container's life: ~8k IPv4 prefixes, a few
+    tens of ms to build, and the source changes at most a few times a week.
+    """
+    if _cloud_ranges_cache.get('expires', 0) > time.time():
+        return _cloud_ranges_cache['networks']
+    try:
+        resp = requests.get(
+            AWS_IP_RANGES_URL,
+            timeout=6,
+            headers={'User-Agent': 'port-guardian/1.0'},
+        )
+        resp.raise_for_status()
+        networks = [
+            ipaddress.ip_network(p['ip_prefix']) for p in resp.json()['prefixes']
+        ]
+    except Exception:
+        return None
+    _cloud_ranges_cache.update(
+        networks=networks, expires=time.time() + CLOUD_RANGES_TTL_SECONDS
+    )
+    return networks
+
+
+def _is_cloud_ip(ip):
+    """Whether ip sits in a cloud provider's own address space.
+
+    None means undetermined (the range list was unreachable, or the provider is
+    one we don't check) — callers must read that as "don't assume either way"
+    rather than "not cloud".
+    """
+    networks = _cloud_networks()
+    if networks is None:
+        return None
+    addr = ipaddress.ip_address(ip)
+    return any(addr in net for net in networks)
+
+
 def _rdap_candidates(data):
     """Allocation blocks described by an RDAP response's `handle`.
 
     `handle` is a range ('a - b'), a CIDR, or — for space registered directly to
     ARIN — an opaque id ('NET-52-0-0-0-1') that carries no network at all, in which
-    case the caller falls back to a fixed width. The response also has a
-    startAddress/endAddress pair that would cover that last case, but adopting it
-    widens cloud-hosted client IPs from /24 to a clamped /16 of provider space, so
-    it waits on per-provider /32 handling (see .dev/TODO.md).
+    case the caller falls back to a fixed width. The response also carries a
+    startAddress/endAddress pair that would resolve that last case, but it is left
+    alone on purpose: for the opaque-handle IPs seen here it yields provider space
+    clamped to a /16 of other tenants' addresses, while the churn it would save
+    only applies to ARIN-region consumer ISPs. APNIC allocations, which is what
+    these users dial in from, already arrive as a parseable handle range.
     """
     handle = data.get("handle", "")
     if " - " in handle:
@@ -116,7 +168,13 @@ def _rdap_candidates(data):
 
 
 def _rdap_cidr(data, ip):
-    """Whitelist block for ip: its RDAP allocation block, clamped to /16.
+    """The block to whitelist for ip.
+
+    A cloud-hosted IP is whitelisted as a single address: it is static or Elastic,
+    so a wider block buys no churn resistance, while the space around it belongs to
+    other tenants — a /16 there would admit tens of thousands of strangers'
+    instances. Everything else uses the RDAP allocation block containing ip,
+    clamped to /16.
 
     An address range summarizes into one or more blocks, and only the block that
     actually holds ip is usable as a whitelist entry — the first block often is
@@ -124,6 +182,8 @@ def _rdap_cidr(data, ip):
     block is always verified to contain ip; if none does, or RDAP is unavailable,
     fall back to ip/24.
     """
+    if _is_cloud_ip(ip):
+        return str(ipaddress.ip_network(f"{ip}/{EXACT_PREFIX_LEN}", strict=False))
     addr = ipaddress.ip_address(ip)
     net = None
     if data:
