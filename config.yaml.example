@@ -47,3 +47,9 @@ max_prefix_len: 16
 
 lambda:
   deploy_region: ap-southeast-1
+  # CloudWatch retention for the Lambda's log group. /status logs the client IP on
+  # every request, so this bounds how long that history is kept. Applied by
+  # setup.py on deploy — Chalice's log_retention_in_days targets the wrong log
+  # group for the REST API handler. Must be a value CloudWatch accepts
+  # (1,3,5,7,14,30,60,90,...); omit to leave retention untouched.
+  log_retention_days: 30

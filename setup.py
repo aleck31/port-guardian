@@ -128,6 +128,40 @@ def chalice_deploy(cfg):
     return role_arn, api_url
 
 
+def ensure_log_retention(cfg):
+    """Apply the configured retention to the Lambda's log group.
+
+    Chalice's own `log_retention_in_days` cannot be used here: it derives the log
+    group from the resource name ('<app>-<stage>-api_handler'), but the REST API
+    handler's function is renamed to '<app>-<stage>' afterwards for back-compat and
+    the log group name is not updated to match. Setting it would put retention on a
+    log group nothing writes to and leave the real one never-expiring.
+    """
+    days = cfg.get('lambda', {}).get('log_retention_days')
+    if not days:
+        return
+    region = cfg.get('lambda', {}).get('deploy_region', 'ap-southeast-1')
+    log_group = '/aws/lambda/port-guardian-prod'
+    logs = primary_session().client('logs', region_name=region)
+
+    groups = logs.describe_log_groups(logGroupNamePrefix=log_group)['logGroups']
+    current = next(
+        (g.get('retentionInDays') for g in groups if g['logGroupName'] == log_group),
+        None,
+    )
+    if current == days:
+        print(f'  Log retention already {days}d on {log_group}')
+        return
+    try:
+        logs.put_retention_policy(logGroupName=log_group, retentionInDays=days)
+    except logs.exceptions.ResourceNotFoundException:
+        # Lambda creates the group on first invocation; on a fresh deploy it may
+        # not exist yet, and retention has to outlive that ordering.
+        logs.create_log_group(logGroupName=log_group)
+        logs.put_retention_policy(logGroupName=log_group, retentionInDays=days)
+    print(f'  Log retention set to {days}d (was {current or "never expire"})')
+
+
 def bounce_lambda(cfg):
     """Force a Lambda container roll so it drops cached STS creds and re-assumes the
     target role with the latest permissions. Needed after an IAM policy change, since
@@ -356,6 +390,7 @@ def main():
         step += 1
         print(f'[{step}/{total}] Deploying chalice app...')
         role_arn, _ = chalice_deploy(cfg)
+        ensure_log_retention(cfg)
         print()
 
     iam_changed = False
