@@ -9,6 +9,7 @@ Usage:
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -86,12 +87,23 @@ def find_prefix_list(ec2):
 # Command: deploy (default)
 # ---------------------------------------------------------------------------
 
-def chalice_deploy():
-    """Run chalice deploy, return (role_arn, api_url) from deployed state."""
+def chalice_deploy(cfg):
+    """Run chalice deploy, return (role_arn, api_url) from deployed state.
+
+    The region comes from config.yaml rather than the caller's shell: chalice
+    resolves it through boto3, which otherwise needs AWS_DEFAULT_REGION or a region
+    in ~/.aws/config and fails with "No region configured" when neither is set.
+    """
     chalice_dir = Path(__file__).resolve().parent / 'app'
+    env = {
+        **os.environ,
+        'AWS_DEFAULT_REGION': cfg.get('lambda', {}).get('deploy_region', 'ap-southeast-1'),
+    }
+    if PRIMARY_PROFILE:
+        env['AWS_PROFILE'] = PRIMARY_PROFILE
     result = subprocess.run(
         ['uv', 'run', 'chalice', 'deploy', '--stage', 'prod'],
-        cwd=chalice_dir, capture_output=True, text=True,
+        cwd=chalice_dir, capture_output=True, text=True, env=env,
     )
     print(result.stdout)
     if result.stderr:
@@ -343,7 +355,7 @@ def main():
     if 'deploy' in steps:
         step += 1
         print(f'[{step}/{total}] Deploying chalice app...')
-        role_arn, _ = chalice_deploy()
+        role_arn, _ = chalice_deploy(cfg)
         print()
 
     iam_changed = False
