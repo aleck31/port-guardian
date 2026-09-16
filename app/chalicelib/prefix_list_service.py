@@ -20,6 +20,11 @@ MANAGED_BY_TAG = 'port-guardian'
 PREFIX_LIST_NAME = 'port-guardian-whitelist'
 DESCRIPTION_PREFIX = 'port-guardian'
 
+# Widest block ever whitelisted: a wider RDAP allocation is clamped to this.
+WIDEST_PREFIX_LEN = 16
+# Used when RDAP is unavailable, or its data covers the IP in no block.
+FALLBACK_PREFIX_LEN = 24
+
 # Cache: {role_arn: (credentials_dict, expiry_timestamp)}
 _sts_cache: dict = {}
 
@@ -85,31 +90,53 @@ def _fetch_rdap(ip):
         return None
 
 
+def _summarize_range(start, end):
+    """CIDR blocks covering the inclusive address range [start, end]."""
+    return list(ipaddress.summarize_address_range(
+        ipaddress.ip_address(start.strip()),
+        ipaddress.ip_address(end.strip()),
+    ))
+
+
+def _rdap_candidates(data):
+    """Allocation blocks described by an RDAP response's `handle`.
+
+    `handle` is a range ('a - b'), a CIDR, or — for space registered directly to
+    ARIN — an opaque id ('NET-52-0-0-0-1') that carries no network at all, in which
+    case the caller falls back to a fixed width. The response also has a
+    startAddress/endAddress pair that would cover that last case, but adopting it
+    widens cloud-hosted client IPs from /24 to a clamped /16 of provider space, so
+    it waits on per-provider /32 handling (see .dev/TODO.md).
+    """
+    handle = data.get("handle", "")
+    if " - " in handle:
+        return _summarize_range(*handle.split(" - ", 1))
+    if "/" in handle:
+        return [ipaddress.ip_network(handle, strict=False)]
+    return []
+
+
 def _rdap_cidr(data, ip):
-    """Extract CIDR from RDAP data, capped at /16. Falls back to /24."""
-    import ipaddress as _ip
+    """Whitelist block for ip: its RDAP allocation block, clamped to /16.
+
+    An address range summarizes into one or more blocks, and only the block that
+    actually holds ip is usable as a whitelist entry — the first block often is
+    not, and adding it succeeded while never matching the user's IP. So the chosen
+    block is always verified to contain ip; if none does, or RDAP is unavailable,
+    fall back to ip/24.
+    """
+    addr = ipaddress.ip_address(ip)
+    net = None
     if data:
         try:
-            handle = data.get("handle", "")
-            if " - " in handle:
-                start, end = handle.split(" - ", 1)
-                cidrs = list(_ip.summarize_address_range(
-                    _ip.ip_address(start.strip()),
-                    _ip.ip_address(end.strip()),
-                ))
-                if cidrs:
-                    net = cidrs[0]
-                    if net.prefixlen < 16:
-                        net = _ip.ip_network(f"{ip}/16", strict=False)
-                    return str(net)
-            if "/" in handle:
-                net = _ip.ip_network(handle, strict=False)
-                if net.prefixlen < 16:
-                    net = _ip.ip_network(f"{ip}/16", strict=False)
-                return str(net)
-        except Exception:
-            pass
-    return str(ipaddress.ip_network(f"{ip}/24", strict=False))
+            net = next((n for n in _rdap_candidates(data) if addr in n), None)
+        except (ValueError, TypeError):
+            net = None
+    if net is None:
+        return str(ipaddress.ip_network(f"{ip}/{FALLBACK_PREFIX_LEN}", strict=False))
+    if net.prefixlen < WIDEST_PREFIX_LEN:
+        net = ipaddress.ip_network(f"{ip}/{WIDEST_PREFIX_LEN}", strict=False)
+    return str(net)
 
 
 def get_bgp_prefix(ip):
