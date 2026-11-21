@@ -75,14 +75,23 @@ input:focus{outline:none;border-color:#0066cc}
   <div id="login-section" class="card">
     <h2>Sign In</h2>
     <form id="login-form" onsubmit="login(event)">
-      <input type="text" id="username" placeholder="Username" autocomplete="username" required>
-      <input type="password" id="password" placeholder="Password" autocomplete="current-password" required>
-      <div style="display:flex;align-items:center;margin-bottom:.75rem;gap:.5rem">
-        <input type="checkbox" id="remember-me" style="width:auto;margin:0">
-        <label for="remember-me" style="font-size:.85rem;color:#666;cursor:pointer">Remember me</label>
+      <div id="password-step">
+        <input type="text" id="username" placeholder="Username" autocomplete="username" required>
+        <input type="password" id="password" placeholder="Password" autocomplete="current-password" required>
+        <div style="display:flex;align-items:center;margin-bottom:.75rem;gap:.5rem">
+          <input type="checkbox" id="remember-me" style="width:auto;margin:0">
+          <label for="remember-me" style="font-size:.85rem;color:#666;cursor:pointer">Remember me</label>
+        </div>
+      </div>
+      <div id="mfa-step" class="hidden">
+        <p style="font-size:.85rem;color:#666;margin-bottom:.75rem">Enter the 6-digit code from your authenticator app.</p>
+        <input type="text" id="mfa-code" placeholder="123456" inputmode="numeric" autocomplete="one-time-code" pattern="\d{6}" maxlength="6">
       </div>
       <div id="login-error"></div>
       <button type="submit" id="login-btn" class="btn btn-login">Sign in</button>
+      <div id="mfa-cancel" class="hidden" style="text-align:center;margin-top:.75rem">
+        <button type="button" onclick="cancelMfa()" style="background:none;border:none;color:#999;font-size:.8rem;cursor:pointer">Back</button>
+      </div>
     </form>
   </div>
 
@@ -143,35 +152,109 @@ function showMain() {
   fetchStatus();
 }
 
+// Cognito user-pool API: unauthenticated JSON calls to the regional endpoint.
+async function cognitoCall(action, body) {
+  const res = await fetch(CONFIG.cognitoEndpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-amz-json-1.1',
+      'X-Amz-Target': 'AWSCognitoIdentityProviderService.' + action
+    },
+    body: JSON.stringify(body)
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.message || data.__type || 'Authentication failed');
+  return data;
+}
+
+function passwordAuth(username, password) {
+  return cognitoCall('InitiateAuth', {
+    AuthFlow: 'USER_PASSWORD_AUTH',
+    ClientId: CONFIG.clientId,
+    AuthParameters: { USERNAME: username, PASSWORD: password }
+  });
+}
+
+// TOTP challenge awaiting a code: {username, session}. USER_ID_FOR_SRP is the
+// canonical username, which differs from what was typed when an alias is used.
+let mfaPending = null;
+
+function beginMfa(data, typedUsername) {
+  const params = data.ChallengeParameters || {};
+  mfaPending = { username: params.USER_ID_FOR_SRP || typedUsername, session: data.Session };
+}
+
+function setMfaStep(on) {
+  document.getElementById('password-step').classList.toggle('hidden', on);
+  document.getElementById('mfa-step').classList.toggle('hidden', !on);
+  document.getElementById('mfa-cancel').classList.toggle('hidden', !on);
+  document.getElementById('login-btn').textContent = on ? 'Verify' : 'Sign in';
+  const code = document.getElementById('mfa-code');
+  code.required = on;
+  code.value = '';
+  if (on) code.focus();
+}
+
+function cancelMfa() {
+  mfaPending = null;
+  setMfaStep(false);
+  document.getElementById('login-error').style.display = 'none';
+}
+
+// Returns tokens, or null after switching the form to the code step.
+async function signInStep(username, password) {
+  if (!mfaPending) {
+    const data = await passwordAuth(username, password);
+    if (data.ChallengeName === 'SOFTWARE_TOKEN_MFA') {
+      beginMfa(data, username);
+      setMfaStep(true);
+      return null;
+    }
+    if (data.ChallengeName) {
+      throw new Error('Sign-in needs a step this page does not support (' + data.ChallengeName + ').');
+    }
+    return data.AuthenticationResult;
+  }
+  try {
+    const data = await cognitoCall('RespondToAuthChallenge', {
+      ChallengeName: 'SOFTWARE_TOKEN_MFA',
+      ClientId: CONFIG.clientId,
+      Session: mfaPending.session,
+      ChallengeResponses: {
+        USERNAME: mfaPending.username,
+        SOFTWARE_TOKEN_MFA_CODE: document.getElementById('mfa-code').value.trim()
+      }
+    });
+    return data.AuthenticationResult;
+  } catch (err) {
+    // A rejected code may consume the session, and it expires after 3 minutes, so
+    // re-run the password step (still filled in) for a fresh one before retrying.
+    const fresh = await passwordAuth(username, password);
+    if (fresh.ChallengeName !== 'SOFTWARE_TOKEN_MFA') throw err;
+    beginMfa(fresh, username);
+    setMfaStep(true);
+    throw new Error('Incorrect or expired code. Enter the current code.');
+  }
+}
+
 async function login(e) {
   e.preventDefault();
   const btn = document.getElementById('login-btn');
   const errEl = document.getElementById('login-error');
+  const username = document.getElementById('username').value;
+  const password = document.getElementById('password').value;
   errEl.style.display = 'none';
   btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span>Signing in…';
+  btn.innerHTML = '<span class="spinner"></span>' + (mfaPending ? 'Verifying…' : 'Signing in…');
   try {
-    const res = await fetch(CONFIG.cognitoEndpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-amz-json-1.1',
-        'X-Amz-Target': 'AWSCognitoIdentityProviderService.InitiateAuth'
-      },
-      body: JSON.stringify({
-        AuthFlow: 'USER_PASSWORD_AUTH',
-        ClientId: CONFIG.clientId,
-        AuthParameters: {
-          USERNAME: document.getElementById('username').value,
-          PASSWORD: document.getElementById('password').value
-        }
-      })
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.message || data.__type || 'Authentication failed');
-    idToken = data.AuthenticationResult.IdToken;
+    const tokens = await signInStep(username, password);
+    if (!tokens) return;
+    mfaPending = null;
+    setMfaStep(false);
+    idToken = tokens.IdToken;
     sessionStorage.setItem('id_token', idToken);
     if (document.getElementById('remember-me').checked) {
-      await saveCredentials(document.getElementById('username').value, document.getElementById('password').value);
+      await saveCredentials(username, password);
     } else {
       localStorage.removeItem(CRED_KEY);
     }
@@ -181,13 +264,14 @@ async function login(e) {
     errEl.style.display = 'block';
   } finally {
     btn.disabled = false;
-    btn.textContent = 'Sign in';
+    btn.textContent = mfaPending ? 'Verify' : 'Sign in';
   }
 }
 
 function logout() {
   idToken = null;
   sessionStorage.removeItem('id_token');
+  cancelMfa();
   document.getElementById('main-section').classList.add('hidden');
   document.getElementById('login-section').classList.remove('hidden');
   document.getElementById('password').value = '';
