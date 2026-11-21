@@ -13,10 +13,11 @@ app = Chalice(app_name='port-guardian')
 # Chalice defaults to ERROR; the client_ip observations below are INFO.
 app.log.setLevel(logging.INFO)
 
+# Required: setup.py writes these from config.yaml; a missing one fails the deploy.
 COGNITO_USER_POOL_ARN = (
-    f"arn:aws:cognito-idp:{os.environ.get('COGNITO_REGION', 'ap-southeast-1')}:"
-    f"{os.environ.get('PRIMARY_ACCOUNT_ID', '222829864634')}:"
-    f"userpool/{os.environ.get('COGNITO_USER_POOL_ID', 'ap-southeast-1_WBHlZF1Zf')}"
+    f"arn:aws:cognito-idp:{os.environ['COGNITO_REGION']}:"
+    f"{os.environ['PRIMARY_ACCOUNT_ID']}:"
+    f"userpool/{os.environ['COGNITO_USER_POOL_ID']}"
 )
 
 authorizer = CognitoUserPoolAuthorizer(
@@ -58,11 +59,11 @@ def _get_targets():
 @app.route('/', methods=['GET'])
 def index():
     html = _get_html()
-    cognito_region = os.environ.get('COGNITO_REGION', 'ap-southeast-1')
+    cognito_region = os.environ['COGNITO_REGION']
     html = (
         html
         .replace('{{COGNITO_ENDPOINT}}', f'https://cognito-idp.{cognito_region}.amazonaws.com/')
-        .replace('{{COGNITO_CLIENT_ID}}', os.environ.get('COGNITO_CLIENT_ID', ''))
+        .replace('{{COGNITO_CLIENT_ID}}', os.environ['COGNITO_CLIENT_ID'])
         .replace('{{VERSION}}', os.environ.get('APP_VERSION', 'dev'))
     )
     return Response(body=html, status_code=200, headers={'Content-Type': 'text/html'})
