@@ -76,6 +76,20 @@ input:focus{outline:none;border-color:#0066cc}
     </div>
   </div>
 </div>
+<div id="list-sync-modal" style="position:fixed;inset:0;background:rgba(0,0,0,.4);display:none;align-items:center;justify-content:center;z-index:998" onclick="if(event.target===this)closeListSyncModal()">
+  <div style="background:#fff;border-radius:12px;max-width:780px;width:92%;max-height:86vh;overflow-y:auto;padding:1.5rem">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.25rem">
+      <h2 style="margin:0">Sync Prefix Lists</h2>
+      <button class="btn-sm" style="background:#9ca3af" onclick="closeListSyncModal()">Close</button>
+    </div>
+    <div id="list-sync-intro" style="font-size:.8rem;color:#888;margin-bottom:.75rem"></div>
+    <div id="list-sync-body" style="font-size:.85rem;color:#666">Loading…</div>
+    <div style="margin-top:1rem;display:flex;align-items:center;gap:.75rem;flex-wrap:wrap">
+      <button id="list-sync-btn" class="btn-sm" style="padding:.45rem 1rem;font-size:.85rem;display:none" onclick="applyListSync()">Confirm sync</button>
+      <span id="list-sync-note" style="font-size:.8rem;color:#888"></span>
+    </div>
+  </div>
+</div>
 <div class="container">
   <header>
     <h1>🛡️ Port Guardian</h1>
@@ -131,6 +145,10 @@ input:focus{outline:none;border-color:#0066cc}
     </div>
     <div class="card">
       <h2>Whitelist Entries<span id="entries-count" style="color:#999;font-weight:400"></span></h2>
+      <div id="drift-banner" style="margin-top:.75rem;padding:.6rem .75rem;border-radius:8px;background:#fef3c7;color:#92400e;font-size:.85rem;display:none;align-items:center;justify-content:space-between;gap:.75rem;flex-wrap:wrap">
+        <span id="drift-text"></span>
+        <button class="btn-sm" style="background:#b45309" onclick="openListSyncModal()">Review sync</button>
+      </div>
       <div id="entries-body" style="margin-top:.75rem;font-size:.85rem;color:#999">Loading…</div>
     </div>
     <div style="display:flex;justify-content:space-between;align-items:center;padding:.5rem">
@@ -395,7 +413,9 @@ async function fetchStatus() {
         return v ? '<td class="status-cell st-ok">✓</td>' : '<td class="status-cell st-no">✗</td>';
       }).join('') + '</tr>'
     ).join('');
+    _listCount = data.list_count || 0;
     renderEntries(data.entries || []);
+    renderDrift(data);
     const needsUpdate = data.regions.some(r => !r.in_prefix_list);
     const btn = document.getElementById('update-btn');
     btn.disabled = !needsUpdate;
@@ -486,7 +506,7 @@ function renderEntries(entries) {
     '<th style="cursor:pointer;user-select:none" onclick="sortEntriesByTime()" title="Sort by time">Added At' + arrow + '</th>' +
     '<th>Description</th><th></th></tr></thead><tbody>' +
     rows.map(({ e, p }) =>
-      '<tr><td>' + esc(e.cidr) + addrCountBadge(e.cidr) + (p.pinned ? ' <span title="Pinned — never auto-evicted">📌</span>' : '') + '</td>' +
+      '<tr><td>' + esc(e.cidr) + addrCountBadge(e.cidr) + (p.pinned ? ' <span title="Pinned — never auto-evicted">📌</span>' : '') + coverageBadge(e) + '</td>' +
         '<td style="color:#888;font-size:.8rem;white-space:nowrap">' + (p.when || '—') + '</td>' +
         '<td style="color:#888;font-size:.8rem">' + esc(p.label) + '</td>' +
         '<td style="text-align:right;white-space:nowrap">' +
@@ -499,6 +519,112 @@ function renderEntries(entries) {
 
 function showOverlay() { document.getElementById('overlay').style.display = 'flex'; }
 function hideOverlay() { document.getElementById('overlay').style.display = 'none'; }
+
+// Writes report one result per account/region; the primary list is listed first.
+function isFailure(status) { const s = String(status); return s.startsWith('error') || s.startsWith('skipped'); }
+function targetLabel(r) { return r.region + ' (' + r.account + ')' + (r.primary ? ' · primary' : ''); }
+
+function showResults(title, results) {
+  const box = document.getElementById('result');
+  const failed = results.filter(r => isFailure(r.status));
+  box.textContent = (title ? title + '\n' : '') + results.map(r =>
+    (isFailure(r.status) ? '✗ ' : '✓ ') + targetLabel(r) + ': ' + r.status).join('\n');
+  box.className = failed.length ? 'result-err' : 'result-ok';
+  // Inline display:none from the markup would otherwise beat the class's display:block.
+  box.style.display = 'block';
+  // Delete and pin are triggered from the entries list, far below the result box.
+  if (failed.length) box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+// Lists are compared against the primary; a sync makes every other list match it.
+let _listCount = 0;
+
+function coverageBadge(e) {
+  if (e.in_primary === undefined) return '';
+  if (!e.in_primary) return ' <span style="color:#dc2626;font-size:.75rem" title="Not in the primary list: a sync removes it everywhere">not in primary</span>';
+  if (e.lists < _listCount) return ' <span style="color:#b45309;font-size:.75rem" title="Missing from some lists: a sync adds it">' + e.lists + '/' + _listCount + ' lists</span>';
+  return '';
+}
+
+function renderDrift(data) {
+  const banner = document.getElementById('drift-banner');
+  const text = document.getElementById('drift-text');
+  const p = data.primary;
+  if (!p) { banner.style.display = 'none'; return; }
+  const where = p.region + ' (' + p.account + ')';
+  if (!p.readable) {
+    text.textContent = '⚠ The primary list ' + where + ' could not be read, so drift between lists is unknown.';
+  } else if ((data.drift || []).length) {
+    text.textContent = '⚠ ' + data.drift.length + ' of ' + (_listCount - 1) + ' other lists differ from the primary ' + where + '.';
+  } else {
+    banner.style.display = 'none';
+    return;
+  }
+  banner.querySelector('button').style.display = p.readable ? '' : 'none';
+  banner.style.display = 'flex';
+}
+
+// --- Prefix list sync modal: dry-run plan first, Confirm applies it ---
+function openListSyncModal() {
+  document.getElementById('list-sync-modal').style.display = 'flex';
+  document.getElementById('list-sync-body').textContent = 'Comparing lists…';
+  document.getElementById('list-sync-btn').style.display = 'none';
+  document.getElementById('list-sync-note').textContent = '';
+  apiFetch('/sync-entries', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ dry_run: true }) })
+    .then(d => renderListSync(d, true))
+    .catch(e => { document.getElementById('list-sync-body').textContent = 'Failed: ' + e.message; });
+}
+
+function closeListSyncModal() { document.getElementById('list-sync-modal').style.display = 'none'; }
+
+function renderListSync(d, preview) {
+  const esc = s => String(s || '').replace(/</g, '&lt;');
+  const p = d.primary || {};
+  document.getElementById('list-sync-intro').textContent =
+    'Primary: ' + p.region + ' (' + p.account + '). Every other list is made identical to it — ' +
+    'entries missing there are added, entries the primary does not have are removed.';
+  const body = document.getElementById('list-sync-body');
+  if (d.error) { body.innerHTML = '<span style="color:#dc2626">' + esc(d.error) + '</span>'; return; }
+  // One line per added/removed CIDR, with its description: a bare CIDR says nothing about what it is.
+  const lines = (cidrs, sign, color, verb, descs) => (cidrs || []).map(c =>
+    '<div style="margin:.15rem 0 .45rem" title="' + verb + '">' +
+      '<div style="color:' + color + '">' + sign + ' ' + esc(c) + addrCountBadge(c) + '</div>' +
+      '<div style="color:#888;padding-left:1rem;font-size:.75rem">' + (esc(descs[c]) || '<i>no description</i>') + '</div></div>').join('');
+  body.innerHTML = d.results.map(r => {
+    const failed = isFailure(r.status);
+    const rewrites = (r.update || []).length
+      ? '<span style="color:#6b7280" title="' + esc((r.update || []).join(', ')) + '">~ ' + r.update.length + ' description' +
+        (r.update.length > 1 ? 's' : '') + (preview ? ' to rewrite' : ' rewritten') + '</span>' : '';
+    const descs = r.descriptions || {};
+    const changes = lines(r.add, '+', '#16a34a', preview ? 'will add' : 'added', descs) +
+                    lines(r.remove, '−', '#dc2626', preview ? 'will remove' : 'removed', descs) + rewrites;
+    const lockout = r.loses_current_ip
+      ? '<div style="color:#dc2626;font-size:.8rem;margin-top:.2rem">⚠ Removes the access your current IP has in this list</div>' : '';
+    return '<div style="padding:.5rem 0;border-bottom:1px solid #eee">' +
+      '<div><strong>' + esc(targetLabel(r)) + '</strong> <span style="color:' + (failed ? '#dc2626' : '#888') + ';font-size:.8rem">' + esc(r.status) + '</span></div>' +
+      (changes ? '<div style="font-size:.8rem;margin-top:.2rem">' + changes + '</div>' : '') + lockout + '</div>';
+  }).join('');
+  const pending = preview && d.results.some(r => r.status === 'out of sync' || r.status === 'descriptions differ');
+  document.getElementById('list-sync-btn').style.display = pending ? '' : 'none';
+  document.getElementById('list-sync-btn').disabled = false;
+  document.getElementById('list-sync-note').textContent = !preview ? 'Done.'
+    : pending ? (d.results.some(r => r.loses_current_ip) ? 'Review the warning above before confirming.' : '')
+    : 'All lists already match the primary.';
+}
+
+async function applyListSync() {
+  const btn = document.getElementById('list-sync-btn');
+  btn.disabled = true;
+  document.getElementById('list-sync-note').textContent = 'Syncing…';
+  try {
+    const d = await apiFetch('/sync-entries', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ dry_run: false }) });
+    renderListSync(d, false);
+    await fetchStatus();
+  } catch (e) {
+    document.getElementById('list-sync-note').textContent = 'Failed: ' + e.message;
+    btn.disabled = false;
+  }
+}
 
 // --- Managed SG modal ---
 // Flow: open → cheap tagged-only overview. Click Sync → dry-run plan (slow PL scan,
@@ -642,15 +768,12 @@ async function updateWhitelist() {
   showOverlay();
   try {
     const data = await apiFetch('/update', { method: 'POST' });
-    const failed = data.results.filter(r => String(r.status).startsWith('error'));
-    result.textContent = data.results.map(r =>
-      (String(r.status).startsWith('error') ? '✗ ' : '✓ ') + r.region + ' (' + r.account + '): ' + r.status
-    ).join('\n');
-    result.className = failed.length ? 'result-err' : 'result-ok';
+    showResults('', data.results);
     await fetchStatus();
   } catch (e) {
     result.textContent = 'Add failed: ' + e.message;
     result.className = 'result-err';
+    result.style.display = 'block';
   } finally {
     hideOverlay();
     btn.innerHTML = 'Add';
@@ -660,7 +783,8 @@ async function updateWhitelist() {
 async function togglePin(cidr, pinned) {
   showOverlay();
   try {
-    await apiFetch('/entries', { method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({cidr, pinned}) });
+    const data = await apiFetch('/entries', { method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({cidr, pinned}) });
+    showResults((pinned ? 'Pin ' : 'Unpin ') + cidr, data.results);
     await fetchStatus();
   } catch (e) {
     alert((pinned ? 'Pin' : 'Unpin') + ' failed: ' + e.message);
@@ -673,7 +797,8 @@ async function deleteEntry(cidr) {
   if (!confirm('Delete ' + cidr + ' from all regions?')) return;
   showOverlay();
   try {
-    await apiFetch('/entries', { method: 'DELETE', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({cidr}) });
+    const data = await apiFetch('/entries', { method: 'DELETE', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({cidr}) });
+    showResults('Delete ' + cidr, data.results);
     await fetchStatus();
   } catch (e) {
     alert('Delete failed: ' + e.message);

@@ -1,7 +1,8 @@
 """Prefix List service — EC2 client factory and prefix list operations.
 
-Provides cross-account EC2 client creation with STS credential caching,
-and prefix list lookup / check / add operations.
+Provides cross-account EC2 client creation with STS credential caching, the RDAP
+and cloud-range lookup that picks a whitelist block, the add / remove / pin writes,
+and the diff and sync used to make replica lists match the primary.
 """
 
 import ipaddress
@@ -259,15 +260,10 @@ def get_prefix_list_id(ec2_client):
     return None
 
 
-def check_ip_in_prefix_list(ec2_client, prefix_list_id, ip):
-    """Check whether any prefix list entry contains the IP."""
+def covers(entries, ip):
+    """Whether any entry's CIDR contains ip."""
     addr = ipaddress.ip_address(ip)
-    paginator = ec2_client.get_paginator('get_managed_prefix_list_entries')
-    for page in paginator.paginate(PrefixListId=prefix_list_id):
-        for entry in page.get('Entries', []):
-            if addr in ipaddress.ip_network(entry['Cidr'], strict=False):
-                return True
-    return False
+    return any(addr in ipaddress.ip_network(e['Cidr'], strict=False) for e in entries)
 
 
 PIN_MARKER = '[PIN]'
@@ -306,15 +302,36 @@ def _eviction_threshold(prefix_list_id):
     return _max_entries_override.get(prefix_list_id, configured)
 
 
-def add_ip_to_prefix_list(ec2_client, prefix_list_id, ip):
-    """Add BGP prefix for ip to the prefix list with FIFO eviction.
+def _read_list(ec2_client, prefix_list_id):
+    """(prefix list, its entries), with the entries read at exactly that version.
 
-    Eviction triggers at the CONFIGURED threshold (decoupled from the PL's real
-    MaxEntries). If config exceeds the real capacity and the add fails, learn the
-    real value for subsequent calls and raise a clear error for this one.
+    A modify against this version then succeeds only if nothing changed since the
+    read, so the read entries plus the modify's own changes are the new contents.
     """
-    if check_ip_in_prefix_list(ec2_client, prefix_list_id, ip):
-        return 'already_exists'
+    pl = ec2_client.describe_managed_prefix_lists(PrefixListIds=[prefix_list_id])['PrefixLists'][0]
+    entries = []
+    paginator = ec2_client.get_paginator('get_managed_prefix_list_entries')
+    for page in paginator.paginate(PrefixListId=prefix_list_id, TargetVersion=pl['Version']):
+        entries.extend(page.get('Entries', []))
+    return pl, entries
+
+
+def _entry(cidr, description):
+    # AddEntries rejects an empty Description; omit the key instead.
+    return {'Cidr': cidr, 'Description': description} if description else {'Cidr': cidr}
+
+
+def add_ip_to_prefix_list(ec2_client, prefix_list_id, ip):
+    """Add the whitelist block for ip, FIFO-evicting the oldest unpinned entry if full.
+
+    Returns (status, entries): 'added' or 'already_exists', and the list's contents
+    afterwards. Eviction triggers at the CONFIGURED threshold (decoupled from the
+    PL's real MaxEntries). If config exceeds the real capacity and the add fails,
+    learn the real value for subsequent calls and raise a clear error for this one.
+    """
+    pl, entries = _read_list(ec2_client, prefix_list_id)
+    if covers(entries, ip):
+        return 'already_exists', entries
 
     rdap = _fetch_rdap(ip)
     cidr = _rdap_cidr(rdap, ip)
@@ -322,26 +339,14 @@ def add_ip_to_prefix_list(ec2_client, prefix_list_id, ip):
     isp = ' '.join(_rdap_org(rdap).split()[:2])  # e.g. 'China Mobile Peoples Telephone...' -> 'China Mobile'
     ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     description = f'[Guard] {country} {isp} {ts}'.replace('  ', ' ')
-
-    resp = ec2_client.describe_managed_prefix_lists(
-        PrefixListIds=[prefix_list_id]
-    )
-    pl = resp['PrefixLists'][0]
-    version = pl['Version']
     threshold = _eviction_threshold(prefix_list_id)
-
-    # Count current entries
-    entries = []
-    paginator = ec2_client.get_paginator('get_managed_prefix_list_entries')
-    for page in paginator.paginate(PrefixListId=prefix_list_id):
-        entries.extend(page.get('Entries', []))
 
     modify_args = {
         'PrefixListId': prefix_list_id,
-        'CurrentVersion': version,
+        'CurrentVersion': pl['Version'],
         'AddEntries': [{'Cidr': cidr, 'Description': description}],
     }
-
+    evicted = None
     if len(entries) >= threshold:
         evictable = [e for e in entries if not is_pinned(e.get('Description', ''))]
         if not evictable:
@@ -349,14 +354,14 @@ def add_ip_to_prefix_list(ec2_client, prefix_list_id, ip):
                 f'prefix list full ({len(entries)}/{threshold}) and all entries are '
                 f'pinned ([PIN]); cannot add {cidr} — unpin an entry or raise max_entries'
             )
-        oldest = min(evictable, key=lambda e: _parse_entry_timestamp(e.get('Description', '')))
-        modify_args['RemoveEntries'] = [{'Cidr': oldest['Cidr']}]
+        evicted = min(evictable, key=lambda e: _parse_entry_timestamp(e.get('Description', '')))['Cidr']
+        modify_args['RemoveEntries'] = [{'Cidr': evicted}]
 
     try:
         ec2_client.modify_managed_prefix_list(**modify_args)
     except ClientError:
         real_max = pl['MaxEntries']
-        if 'RemoveEntries' not in modify_args and len(entries) >= real_max:
+        if evicted is None and len(entries) >= real_max:
             # Config said there was room but the PL is actually full: learn the real
             # capacity so the next add evicts correctly, and surface the mismatch.
             _max_entries_override[prefix_list_id] = real_max
@@ -365,7 +370,8 @@ def add_ip_to_prefix_list(ec2_client, prefix_list_id, ip):
                 f'({real_max}); now using {real_max} — retry the add'
             )
         raise
-    return 'added'
+    kept = [e for e in entries if e['Cidr'] != evicted]
+    return 'added', kept + [{'Cidr': cidr, 'Description': description}]
 
 
 def get_all_entries(ec2_client, prefix_list_id):
@@ -378,26 +384,26 @@ def get_all_entries(ec2_client, prefix_list_id):
 
 
 def remove_cidr_from_prefix_list(ec2_client, prefix_list_id, cidr):
-    """Remove a CIDR entry from the prefix list."""
-    resp = ec2_client.describe_managed_prefix_lists(PrefixListIds=[prefix_list_id])
-    version = resp['PrefixLists'][0]['Version']
+    """Remove cidr if present. Returns (status, entries afterwards)."""
+    pl, entries = _read_list(ec2_client, prefix_list_id)
+    if not any(e['Cidr'] == cidr for e in entries):
+        return 'absent', entries
     ec2_client.modify_managed_prefix_list(
         PrefixListId=prefix_list_id,
-        CurrentVersion=version,
+        CurrentVersion=pl['Version'],
         RemoveEntries=[{'Cidr': cidr}],
     )
+    return 'removed', [e for e in entries if e['Cidr'] != cidr]
 
 
 def set_pin(ec2_client, prefix_list_id, cidr, pinned):
     """Add or remove the [PIN] marker on a CIDR's description.
 
-    No rename API, but AddEntries with an already-present CIDR overwrites its
-    Description in place (verified against a live prefix list) — no RemoveEntries,
-    no remove-then-add, no waiting out modify-in-progress between two calls.
+    Returns (status, entries afterwards). There is no rename API, but AddEntries
+    with an already-present CIDR overwrites its Description in place (verified
+    against a live prefix list), so this is one call with no RemoveEntries.
     """
-    resp = ec2_client.describe_managed_prefix_lists(PrefixListIds=[prefix_list_id])
-    pl = resp['PrefixLists'][0]
-    entries = get_all_entries(ec2_client, prefix_list_id)
+    pl, entries = _read_list(ec2_client, prefix_list_id)
     entry = next((e for e in entries if e['Cidr'] == cidr), None)
     if entry is None:
         raise ValueError(f'{cidr} not found in prefix list')
@@ -408,10 +414,44 @@ def set_pin(ec2_client, prefix_list_id, cidr, pinned):
     elif not pinned and is_pinned(desc):
         new_desc = ' '.join(desc.replace(PIN_MARKER, '').split())
     else:
-        return  # already in the desired state
+        return ('pinned' if pinned else 'unpinned'), entries
 
     ec2_client.modify_managed_prefix_list(
         PrefixListId=prefix_list_id,
         CurrentVersion=pl['Version'],
-        AddEntries=[{'Cidr': cidr, 'Description': new_desc}],
+        AddEntries=[_entry(cidr, new_desc)],
     )
+    after = [_entry(cidr, new_desc) if e['Cidr'] == cidr else e for e in entries]
+    return ('pinned' if pinned else 'unpinned'), after
+
+
+def diff_entries(desired, actual):
+    """CIDRs to add, remove, or rewrite (description differs) to turn actual into desired."""
+    want = {e['Cidr']: e.get('Description', '') for e in desired}
+    have = {e['Cidr']: e.get('Description', '') for e in actual}
+    return {
+        'add': sorted(c for c in want if c not in have),
+        'remove': sorted(c for c in have if c not in want),
+        'update': sorted(c for c in want if c in have and have[c] != want[c]),
+    }
+
+
+def sync_entries(ec2_client, prefix_list_id, desired, dry_run=False):
+    """Make the list's contents equal desired, in one modify call.
+
+    Returns (diff, entries before). Rewrites go through AddEntries, which
+    overwrites a present CIDR's description, so no CIDR is ever in both AddEntries
+    and RemoveEntries — AWS rejects that combination.
+    """
+    pl, actual = _read_list(ec2_client, prefix_list_id)
+    diff = diff_entries(desired, actual)
+    if dry_run or not any(diff.values()):
+        return diff, actual
+    want = {e['Cidr']: e.get('Description', '') for e in desired}
+    args = {'PrefixListId': prefix_list_id, 'CurrentVersion': pl['Version']}
+    if diff['add'] or diff['update']:
+        args['AddEntries'] = [_entry(c, want[c]) for c in diff['add'] + diff['update']]
+    if diff['remove']:
+        args['RemoveEntries'] = [{'Cidr': c} for c in diff['remove']]
+    ec2_client.modify_managed_prefix_list(**args)
+    return diff, actual

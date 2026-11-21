@@ -10,7 +10,8 @@ Port Guardian provides a web UI where authenticated users can view their current
 - **IP info** — Shows ISP, CIDR block, range and country via RDAP, plus how many addresses the block grants
 - **Whitelist entries** — View, pin and delete prefix list entries directly from the UI; blocks of a /16 or wider are highlighted
 - **Multi-account** — Primary account (direct) + secondary account (STS AssumeRole)
-- **Multi-region** — Concurrent updates across all targets with ThreadPoolExecutor
+- **Multi-region** — One primary list (primary account, Lambda's region) is the source of truth; each write lands there first and every other list is then made identical to it, so a failed write can't leave the lists diverged
+- **Drift detection** — The UI flags lists that differ from the primary and entries missing from some lists, and previews a sync before applying it
 - **RDAP prefix lookup** — Whitelists the ISP allocation block that contains the IP, clamped to `max_prefix_len` (default /16), instead of a /32, reducing churn. Clients inside AWS's published ranges get a /32: their address is static, and the space around it belongs to other tenants
 - **CIDR containment** — Checks if IP falls within any existing prefix, not just exact match
 - **FIFO eviction** — Auto-removes oldest entry when prefix list is full; pinned entries (see below) are never evicted
@@ -128,10 +129,11 @@ To use a custom domain instead of the default API Gateway URL:
 | GET | `/manifest.webmanifest`, `/sw.js`, `/icon*.{svg,png}`, `/apple-touch-icon.png` | No | PWA assets |
 | GET | `/ip` | No | Returns `{"ip": "x.x.x.x"}` |
 | GET | `/ipinfo` | Yes | IP details: org, CIDR, range, country (via RDAP) |
-| GET | `/status` | Yes | IP status across all regions + entries |
-| POST | `/update` | Yes | Add IP to all prefix lists |
-| DELETE | `/entries` | Yes | Remove a CIDR from all prefix lists |
-| PATCH | `/entries` | Yes | Pin/unpin a CIDR (`{"cidr": "...", "pinned": true}`) across all prefix lists |
+| GET | `/status` | Yes | IP status across all regions, entries from every list, and drift against the primary list |
+| POST | `/update` | Yes | Add IP to the primary list, then sync the others |
+| DELETE | `/entries` | Yes | Remove a CIDR from the primary list, then sync the others |
+| PATCH | `/entries` | Yes | Pin/unpin a CIDR (`{"cidr": "...", "pinned": true}`) on the primary list, then sync the others |
+| POST | `/sync-entries` | Yes | Make every list match the primary; `{"dry_run": true}` for a preview |
 | GET | `/sgs` | Yes | Overview of tagged Security Groups per account/region |
 | POST | `/sync-sg` | Yes | Reconcile SG ingress to each SG's `port-guardian` tag; `{"dry_run": true}` for a preview, `{"allow_exit": true}` to also revoke rules on untagged SGs |
 

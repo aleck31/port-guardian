@@ -1,4 +1,3 @@
-import ipaddress
 import logging
 import os
 import re
@@ -7,7 +6,10 @@ from pathlib import Path
 
 from chalice import Chalice, CognitoUserPoolAuthorizer, Response
 
-from chalicelib.prefix_list_service import get_ec2_client, get_prefix_list_id, check_ip_in_prefix_list, add_ip_to_prefix_list, get_ip_info, get_all_entries, remove_cidr_from_prefix_list, set_pin
+from chalicelib.prefix_list_service import (
+    covers, diff_entries, get_all_entries, get_ec2_client, get_ip_info, get_prefix_list_id,
+    add_ip_to_prefix_list, remove_cidr_from_prefix_list, set_pin, sync_entries,
+)
 from chalicelib.sg_sync_service import list_managed_sgs, reconcile_sg_rules
 
 app = Chalice(app_name='port-guardian')
@@ -54,6 +56,86 @@ def _get_targets():
             targets.append((primary, r))
             targets.append((secondary, r))
     return targets
+
+
+# ---------------------------------------------------------------------------
+# Primary list — the single source of truth for whitelist contents
+# ---------------------------------------------------------------------------
+# Writes happen on the primary list only, then every replica is made identical to
+# it. Replaying each change on six lists independently let partial failures (and
+# per-list FIFO choices) drift them apart; converging on one list repairs any
+# earlier drift on the next write instead of compounding it.
+
+def _primary_target():
+    """The primary account's list in the region this Lambda runs in."""
+    target = (os.environ['PRIMARY_ACCOUNT_ID'], os.environ['AWS_REGION'])
+    if target not in _get_targets():
+        raise RuntimeError(f'primary target {target} is not among TARGET_REGIONS')
+    return target
+
+
+def _open_list(account_id, region):
+    ec2 = get_ec2_client(account_id, region)
+    pl_id = get_prefix_list_id(ec2)
+    if not pl_id:
+        raise RuntimeError('prefix list not found')
+    return ec2, pl_id
+
+
+def _sync_replicas(desired, dry_run=False, ip=None):
+    """Make every non-primary list match desired; one result dict per replica.
+
+    With ip, flags replicas where the sync would remove the caller's own access.
+    """
+    primary = _primary_target()
+    replicas = [t for t in _get_targets() if t != primary]
+
+    def _one(target):
+        account_id, region = target
+        result = {'account': account_id, 'region': region}
+        try:
+            diff, before = sync_entries(*_open_list(account_id, region), desired, dry_run=dry_run)
+        except Exception as e:
+            app.log.error(f'Sync failed for {account_id}/{region}: {e}')
+            return {**result, 'status': f'error: {e}'}
+        changed = any(diff.values())
+        # Description-only differences change nothing about access; they get tidied
+        # by any sync but don't make a list "out of sync".
+        access = bool(diff['add'] or diff['remove'])
+        status = ('in sync' if not changed else 'synced' if not dry_run
+                  else 'out of sync' if access else 'descriptions differ')
+        result.update(status=status, **diff)
+        # What each added or removed CIDR is, so the change can be judged before confirming.
+        want = {e['Cidr']: e.get('Description', '') for e in desired}
+        have = {e['Cidr']: e.get('Description', '') for e in before}
+        result['descriptions'] = {**{c: have[c] for c in diff['remove']}, **{c: want[c] for c in diff['add']}}
+        if ip and covers(before, ip) and not covers(desired, ip):
+            result['loses_current_ip'] = True
+        return result
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        try:
+            return list(pool.map(_one, replicas, timeout=15))
+        except TimeoutError:
+            return [{'account': a, 'region': r, 'status': 'error: timeout'} for a, r in replicas]
+
+
+def _write_through(mutate):
+    """Run mutate(ec2, pl_id) -> (status, entries) on the primary, then sync replicas.
+
+    If the primary write fails nothing else is touched, so a failed write can never
+    leave the lists diverged; replica failures are reported per target.
+    """
+    account_id, region = _primary_target()
+    head = {'account': account_id, 'region': region, 'primary': True}
+    try:
+        status, entries = mutate(*_open_list(account_id, region))
+    except Exception as e:
+        app.log.error(f'Primary write failed for {account_id}/{region}: {e}')
+        skipped = [{'account': a, 'region': r, 'status': 'skipped: primary write failed'}
+                   for a, r in _get_targets() if (a, r) != (account_id, region)]
+        return [{**head, 'status': f'error: {e}'}] + skipped
+    return [{**head, 'status': status}] + _sync_replicas(entries)
 
 
 # ---------------------------------------------------------------------------
@@ -144,71 +226,80 @@ def status():
     def _check(target):
         account_id, region = target
         try:
-            ec2 = get_ec2_client(account_id, region)
-            pl_id = get_prefix_list_id(ec2)
-            if pl_id:
-                all_entries = get_all_entries(ec2, pl_id)
-                addr = ipaddress.ip_address(ip)
-                in_pl = any(addr in ipaddress.ip_network(e['Cidr'], strict=False) for e in all_entries)
-            else:
-                all_entries, in_pl = [], False
+            entries = get_all_entries(*_open_list(account_id, region))
         except Exception as e:
             app.log.error(f'Error checking {account_id}/{region}: {e}')
-            all_entries, in_pl = [], False
-        return {'account': account_id, 'region': region, 'in_prefix_list': in_pl, 'entries': all_entries}
+            return {'account': account_id, 'region': region, 'in_prefix_list': False, 'error': str(e)}
+        return {'account': account_id, 'region': region, 'in_prefix_list': covers(entries, ip), 'entries': entries}
 
     with ThreadPoolExecutor(max_workers=6) as pool:
         try:
             regions = list(pool.map(_check, targets, timeout=15))
         except TimeoutError:
             app.log.error('Status check timed out')
-            regions = [{'account': a, 'region': r, 'in_prefix_list': False, 'entries': []} for a, r in targets]
+            regions = [{'account': a, 'region': r, 'in_prefix_list': False, 'error': 'timeout'} for a, r in targets]
 
-    # Deduplicate entries across all regions (use first occurrence)
-    seen = {}
-    for r in regions:
-        for e in r.get('entries', []):
-            if e['Cidr'] not in seen:
-                seen[e['Cidr']] = e.get('Description', '')
+    primary = _primary_target()
+    by_target = {(r['account'], r['region']): r for r in regions}
+    readable = [r for r in regions if 'error' not in r]
+    primary_entries = by_target[primary].get('entries')
+
+    # Every entry from any list, so a replica-only grant stays visible: it still
+    # opens ports even though the primary no longer has it.
+    entries = {}
+    for r in sorted(readable, key=lambda r: (r['account'], r['region']) != primary):
+        for e in r['entries']:
+            row = entries.setdefault(e['Cidr'], {'cidr': e['Cidr'], 'description': e.get('Description', ''),
+                                                 'lists': 0, 'in_primary': False})
+            row['lists'] += 1
+            row['in_primary'] |= (r['account'], r['region']) == primary
+
+    drift = []
+    if primary_entries is not None:
+        for r in readable:
+            if (r['account'], r['region']) == primary:
+                continue
+            diff = diff_entries(primary_entries, r['entries'])
+            # Drift means a different set of CIDRs, i.e. different access.
+            if diff['add'] or diff['remove']:
+                drift.append({'account': r['account'], 'region': r['region'], **diff})
 
     return {
         'current_ip': ip,
         'regions': [{k: v for k, v in r.items() if k != 'entries'} for r in regions],
-        'entries': [{'cidr': c, 'description': d} for c, d in sorted(seen.items())],
+        'entries': sorted(entries.values(), key=lambda e: e['cidr']),
+        'list_count': len(readable),
+        'primary': {'account': primary[0], 'region': primary[1], 'readable': primary_entries is not None},
+        'drift': drift,
     }
 
 
 # ---------------------------------------------------------------------------
-# POST /update
+# POST /update — add the caller's IP on the primary, then sync replicas
 # ---------------------------------------------------------------------------
 
 @app.route('/update', methods=['POST'], authorizer=authorizer)
 def update():
     ip = _get_source_ip()
-    targets = _get_targets()
+    return {'ip': ip, 'results': _write_through(lambda ec2, pl_id: add_ip_to_prefix_list(ec2, pl_id, ip))}
 
-    def _add(target):
-        account_id, region = target
-        try:
-            ec2 = get_ec2_client(account_id, region)
-            pl_id = get_prefix_list_id(ec2)
-            if not pl_id:
-                s = 'error: prefix list not found'
-            else:
-                s = add_ip_to_prefix_list(ec2, pl_id, ip)
-        except Exception as e:
-            app.log.error(f'Error updating {account_id}/{region}: {e}')
-            s = f'error: {e}'
-        return {'account': account_id, 'region': region, 'status': s}
 
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        try:
-            results = list(pool.map(_add, targets, timeout=15))
-        except TimeoutError:
-            app.log.error('Update timed out')
-            results = [{'account': a, 'region': r, 'status': 'error: timeout'} for a, r in targets]
+# ---------------------------------------------------------------------------
+# POST /sync-entries — make every replica match the primary
+# ---------------------------------------------------------------------------
 
-    return {'ip': ip, 'results': results}
+@app.route('/sync-entries', methods=['POST'], authorizer=authorizer)
+def sync_entries_route():
+    dry_run = bool((app.current_request.json_body or {}).get('dry_run'))
+    account_id, region = _primary_target()
+    primary = {'account': account_id, 'region': region}
+    try:
+        desired = get_all_entries(*_open_list(account_id, region))
+    except Exception as e:
+        app.log.error(f'Reading primary {account_id}/{region} failed: {e}')
+        return {'primary': primary, 'error': f'cannot read primary list: {e}', 'results': []}
+    results = _sync_replicas(desired, dry_run=dry_run, ip=_get_source_ip())
+    return {'primary': primary, 'dry_run': dry_run, 'results': results}
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +347,7 @@ def sync_sg():
 
 
 # ---------------------------------------------------------------------------
-# DELETE /entries — remove a CIDR from all prefix lists
+# DELETE /entries — remove a CIDR on the primary, then sync replicas
 # ---------------------------------------------------------------------------
 
 @app.route('/entries', methods=['DELETE'], authorizer=authorizer)
@@ -266,32 +357,13 @@ def delete_entry():
     if not cidr:
         return Response(body='{"error":"cidr required"}', status_code=400,
                         headers={'Content-Type': 'application/json'})
-    targets = _get_targets()
-
-    def _remove(target):
-        account_id, region = target
-        try:
-            ec2 = get_ec2_client(account_id, region)
-            pl_id = get_prefix_list_id(ec2)
-            if pl_id:
-                remove_cidr_from_prefix_list(ec2, pl_id, cidr)
-            s = 'removed'
-        except Exception as e:
-            app.log.error(f'Error removing {cidr} from {account_id}/{region}: {e}')
-            s = f'error: {e}'
-        return {'account': account_id, 'region': region, 'status': s}
-
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        try:
-            results = list(pool.map(_remove, targets, timeout=15))
-        except TimeoutError:
-            results = [{'account': a, 'region': r, 'status': 'error: timeout'} for a, r in targets]
-
-    return {'cidr': cidr, 'results': results}
+    # A CIDR only on replicas is 'absent' on the primary; the sync still removes it.
+    return {'cidr': cidr, 'results': _write_through(
+        lambda ec2, pl_id: remove_cidr_from_prefix_list(ec2, pl_id, cidr))}
 
 
 # ---------------------------------------------------------------------------
-# PATCH /entries — pin/unpin a CIDR across all prefix lists
+# PATCH /entries — pin/unpin a CIDR on the primary, then sync replicas
 # ---------------------------------------------------------------------------
 
 @app.route('/entries', methods=['PATCH'], authorizer=authorizer)
@@ -302,25 +374,5 @@ def patch_entry():
     if not cidr:
         return Response(body='{"error":"cidr required"}', status_code=400,
                         headers={'Content-Type': 'application/json'})
-    targets = _get_targets()
-
-    def _pin(target):
-        account_id, region = target
-        try:
-            ec2 = get_ec2_client(account_id, region)
-            pl_id = get_prefix_list_id(ec2)
-            if pl_id:
-                set_pin(ec2, pl_id, cidr, pinned)
-            s = 'pinned' if pinned else 'unpinned'
-        except Exception as e:
-            app.log.error(f'Error setting pin={pinned} for {cidr} in {account_id}/{region}: {e}')
-            s = f'error: {e}'
-        return {'account': account_id, 'region': region, 'status': s}
-
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        try:
-            results = list(pool.map(_pin, targets, timeout=15))
-        except TimeoutError:
-            results = [{'account': a, 'region': r, 'status': 'error: timeout'} for a, r in targets]
-
-    return {'cidr': cidr, 'pinned': pinned, 'results': results}
+    return {'cidr': cidr, 'pinned': pinned, 'results': _write_through(
+        lambda ec2, pl_id: set_pin(ec2, pl_id, cidr, pinned))}

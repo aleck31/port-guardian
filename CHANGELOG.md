@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Added
+
+- Prefix lists that differ from the primary list are flagged in the UI, along with entries missing from some lists; **Review sync** previews the changes per list and warns if one would remove your current IP's access.
+
+### Changed
+
+- Whitelist writes land on one primary list (primary account, Lambda's region) and every other list is then made identical to it. A failed write can no longer leave the lists diverged, and each write repairs drift left by earlier ones. Entries added by hand to a non-primary list are removed on the next write.
+
+### Fixed
+
+- Add, delete and pin show a result for every account and region, including which ones failed. The add result box had been hidden by a styling bug, and delete and pin showed nothing.
+
 ## v0.5.0 — 2026-11-21
 
 ### Added
