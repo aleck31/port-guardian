@@ -18,7 +18,7 @@ Port Guardian provides a web UI where authenticated users can view their current
 - **Pinned entries** — Mark an entry with the pin icon in the UI to exempt it from expiry and FIFO eviction (stored as a `[PIN]` marker in its description); adding a new IP fails with a clear error if the list is full and every entry is pinned
 - **Entry lifetime** — Each entry can expire after 1, 7, 30, 90 or 180 days, or never, chosen when adding; editing sets an exact expiry date. A daily job removes expired entries everywhere. Entries that never expire are retired by FIFO or kept with a pin
 - **Manual entries** — Add any public CIDR with a description, and edit an entry's description or expiry from the UI. Entries added outside Port Guardian (console, CLI) are tagged `external`
-- **Tag-driven SG sync** — A `port-guardian=<ports>` tag on a Security Group is the single source of truth for which ports it opens. The UI's Managed SGs modal previews changes (including rules on untagged/"exit" SGs) before applying; removing the tag and confirming the exit unmanages the SG
+- **Tag-driven SG sync** — A `port-guardian=<ports>` tag on a Security Group is the single source of truth for which ports it opens. The UI's **Security Groups** dialog lists every SG that uses the whitelist — untagged ones included, since an exit sync would remove their rules — and previews changes before applying; removing the tag and confirming the exit unmanages the SG
 - **Cognito auth** — API endpoints protected by Cognito User Pool authorizer; sign-in supports TOTP MFA. Any signed-in user can view; only members of `cognito.admin_group` can make changes
 
 ## Architecture

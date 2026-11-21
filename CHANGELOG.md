@@ -13,6 +13,7 @@
 
 - Whitelist writes land on one primary list (primary account, Lambda's region) and every other list is then made identical to it. A failed write can no longer leave the lists diverged, and each write repairs drift left by earlier ones. Entries added by hand to a non-primary list are removed on the next write.
 - Only members of the `cognito.admin_group` group (new, required in `config.yaml`) can change the whitelist or SG rules; other signed-in users get a read-only view.
+- **Managed SGs** is now **Security Groups**, in the Region Status header, with a short explanation of how the `port-guardian` tag works. Its overview also lists security groups that use the whitelist without the tag, because an exit sync would remove their rules. Users outside the admin group can preview a sync but not apply it.
 - Descriptions are shown without their internal markers: expiry and creation time have their own columns, and a pin shows as an icon.
 - Pinning an entry also clears its expiry.
 

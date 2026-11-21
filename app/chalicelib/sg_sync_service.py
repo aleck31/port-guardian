@@ -37,23 +37,21 @@ def pl_ports_in_sg(sg, pl_id):
     return out
 
 
-def _collect_sgs(ec2, pl_id, tag_key, tagged_only=False):
-    """Return {sg_id: sg} for SGs to consider.
+def _collect_sgs(ec2, pl_id, tag_key):
+    """Return {sg_id: sg}: SGs carrying the tag, plus SGs whose ingress references the PL.
 
-    tagged_only: only SGs carrying the tag (cheap — for the overview). Otherwise also
-    include SGs whose ingress references the PL (the PL-id filter is the slow query),
-    so exit candidates — tag wiped but rule still present — surface for reconcile.
+    The second set is what surfaces untagged SGs — a never-tagged consumer, or one
+    whose tag an IaC run wiped while the rule stayed — which are exit candidates.
     """
     sgs = {}
     for sg in ec2.describe_security_groups(
         Filters=[{'Name': 'tag-key', 'Values': [tag_key]}]
     ).get('SecurityGroups', []):
         sgs[sg['GroupId']] = sg
-    if not tagged_only:
-        for sg in ec2.describe_security_groups(
-            Filters=[{'Name': 'ip-permission.prefix-list-id', 'Values': [pl_id]}]
-        ).get('SecurityGroups', []):
-            sgs.setdefault(sg['GroupId'], sg)
+    for sg in ec2.describe_security_groups(
+        Filters=[{'Name': 'ip-permission.prefix-list-id', 'Values': [pl_id]}]
+    ).get('SecurityGroups', []):
+        sgs.setdefault(sg['GroupId'], sg)
     return sgs
 
 
@@ -66,17 +64,22 @@ def _sg_state(sg, pl_id, tag_key, default_ports=None):
 
 
 def list_managed_sgs(ec2, pl_id, tag_key, default_ports=None):
-    """Overview of tagged SGs only (cheap, no PL-id scan). No mutations."""
+    """Overview of tagged SGs and of untagged SGs that use the PL. No mutations.
+
+    Untagged ones are listed because they are the risky case: an exit sync would
+    revoke their rules, so they must be visible before anyone opens the sync plan.
+    """
     out = []
-    for sg_id, sg in sorted(_collect_sgs(ec2, pl_id, tag_key, tagged_only=True).items()):
+    for sg_id, sg in sorted(_collect_sgs(ec2, pl_id, tag_key).items()):
         tag_val, want, have = _sg_state(sg, pl_id, tag_key, default_ports)
         out.append({
             'sg_id': sg_id,
             'name': sg.get('GroupName', ''),
             'tag': tag_val,
+            'untagged': tag_val is None,
             'want': sorted(want) if want is not None else None,
             'have': sorted(have),
-            'in_sync': want is not None and set(have) == want,
+            'in_sync': tag_val is not None and want is not None and set(have) == want,
         })
     return out
 
@@ -89,8 +92,6 @@ def reconcile_sg_rules(ec2, pl_id, tag_key, default_ports=None, allow_exit=False
     state is undeterminable (legacy tag, no default) are skipped — never touched.
 
     dry_run=True computes the plan without calling AWS (would_add/would_remove/...).
-    This is also the query that does the slow PL-id scan for exit candidates, so the
-    cheap tagged-only overview stays fast.
 
     Untagged SGs are the exit path, but a missing tag can also mean an IaC run wiped
     it (that once took down a live ALB), so exit revokes run only with allow_exit=True.
