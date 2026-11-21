@@ -1,6 +1,7 @@
 import ipaddress
 import logging
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -10,6 +11,9 @@ from chalicelib.prefix_list_service import get_ec2_client, get_prefix_list_id, c
 from chalicelib.sg_sync_service import list_managed_sgs, reconcile_sg_rules
 
 app = Chalice(app_name='port-guardian')
+# API Gateway decides on base64 decoding from the request's first Accept type, and
+# browsers lead with image/avif or image/webp, so PNG icons need the wildcard.
+app.api.binary_types.append('image/*')
 # Chalice defaults to ERROR; the client_ip observations below are INFO.
 app.log.setLevel(logging.INFO)
 
@@ -67,6 +71,42 @@ def index():
         .replace('{{VERSION}}', os.environ.get('APP_VERSION', 'dev'))
     )
     return Response(body=html, status_code=200, headers={'Content-Type': 'text/html'})
+
+
+# ---------------------------------------------------------------------------
+# PWA assets — public: install checks and the service worker fetch them unauthenticated
+# ---------------------------------------------------------------------------
+
+_PWA_DIR = Path(__file__).parent / 'chalicelib' / 'pwa'
+_PWA_ASSETS = {
+    # file: (content type, cache-control)
+    'manifest.webmanifest': ('application/manifest+json', 'no-cache'),
+    # no-cache so a new worker is picked up on the next load
+    'sw.js': ('text/javascript', 'no-cache'),
+    'icon.svg': ('image/svg+xml', 'max-age=86400'),
+    'icon-192.png': ('image/png', 'max-age=86400'),
+    'icon-512.png': ('image/png', 'max-age=86400'),
+    'icon-maskable-512.png': ('image/png', 'max-age=86400'),
+    'apple-touch-icon.png': ('image/png', 'max-age=86400'),
+}
+
+
+def _pwa_view(filename):
+    content_type, cache_control = _PWA_ASSETS[filename]
+    body = (_PWA_DIR / filename).read_bytes()
+
+    def view():
+        return Response(
+            body=body if content_type == 'image/png' else body.decode('utf-8'),
+            status_code=200,
+            headers={'Content-Type': content_type, 'Cache-Control': cache_control},
+        )
+    return view
+
+
+for _filename in _PWA_ASSETS:
+    app.route(f'/{_filename}', methods=['GET'],
+              name='pwa_' + re.sub(r'\W', '_', _filename))(_pwa_view(_filename))
 
 
 # ---------------------------------------------------------------------------
