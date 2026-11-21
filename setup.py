@@ -88,7 +88,7 @@ def find_prefix_list(ec2):
 # ---------------------------------------------------------------------------
 
 def chalice_deploy(cfg):
-    """Run chalice deploy, return (role_arn, api_url) from deployed state.
+    """Run chalice deploy, return (Lambda role ARNs, Lambda function names) from deployed state.
 
     The region comes from config.yaml rather than the caller's shell: chalice
     resolves it through boto3, which otherwise needs AWS_DEFAULT_REGION or a region
@@ -113,23 +113,25 @@ def chalice_deploy(cfg):
 
     # Read deployed state for reliable ARN extraction
     deployed_file = chalice_dir / '.chalice' / 'deployed' / 'prod.json'
-    role_arn = None
+    role_arns, function_names = [], []
     api_url = None
     if deployed_file.exists():
         deployed = json.loads(deployed_file.read_text())
         for res in deployed.get('resources', []):
             if res.get('resource_type') == 'iam_role':
-                role_arn = res['role_arn']
+                role_arns.append(res['role_arn'])
+            if res.get('resource_type') == 'lambda_function':
+                function_names.append(res['lambda_arn'].rsplit(':', 1)[-1])
             if res.get('resource_type') == 'rest_api':
                 api_url = res.get('rest_api_url')
 
     print(f'\n  API URL:  {api_url or "not found"}')
-    print(f'  Role ARN: {role_arn or "not found"}')
-    return role_arn, api_url
+    print(f'  Roles:    {", ".join(role_arns) or "not found"}')
+    return role_arns, function_names
 
 
-def ensure_log_retention(cfg):
-    """Apply the configured retention to the Lambda's log group.
+def ensure_log_retention(cfg, function_names):
+    """Apply the configured retention to every deployed function's log group.
 
     Chalice's own `log_retention_in_days` cannot be used here: it derives the log
     group from the resource name ('<app>-<stage>-api_handler'), but the REST API
@@ -141,25 +143,25 @@ def ensure_log_retention(cfg):
     if not days:
         return
     region = cfg.get('lambda', {}).get('deploy_region', 'ap-southeast-1')
-    log_group = '/aws/lambda/port-guardian-prod'
     logs = primary_session().client('logs', region_name=region)
-
-    groups = logs.describe_log_groups(logGroupNamePrefix=log_group)['logGroups']
-    current = next(
-        (g.get('retentionInDays') for g in groups if g['logGroupName'] == log_group),
-        None,
-    )
-    if current == days:
-        print(f'  Log retention already {days}d on {log_group}')
-        return
-    try:
-        logs.put_retention_policy(logGroupName=log_group, retentionInDays=days)
-    except logs.exceptions.ResourceNotFoundException:
-        # Lambda creates the group on first invocation; on a fresh deploy it may
-        # not exist yet, and retention has to outlive that ordering.
-        logs.create_log_group(logGroupName=log_group)
-        logs.put_retention_policy(logGroupName=log_group, retentionInDays=days)
-    print(f'  Log retention set to {days}d (was {current or "never expire"})')
+    for name in function_names:
+        log_group = f'/aws/lambda/{name}'
+        groups = logs.describe_log_groups(logGroupNamePrefix=log_group)['logGroups']
+        current = next(
+            (g.get('retentionInDays') for g in groups if g['logGroupName'] == log_group),
+            None,
+        )
+        if current == days:
+            print(f'  Log retention already {days}d on {log_group}')
+            continue
+        try:
+            logs.put_retention_policy(logGroupName=log_group, retentionInDays=days)
+        except logs.exceptions.ResourceNotFoundException:
+            # Lambda creates the group on first invocation; on a fresh deploy it may
+            # not exist yet, and retention has to outlive that ordering.
+            logs.create_log_group(logGroupName=log_group)
+            logs.put_retention_policy(logGroupName=log_group, retentionInDays=days)
+        print(f'  Log retention set to {days}d on {log_group} (was {current or "never expire"})')
 
 
 def bounce_lambda(cfg):
@@ -191,6 +193,7 @@ def sync_chalice_config(cfg):
         'COGNITO_USER_POOL_ID': cfg['cognito']['user_pool_id'],
         'COGNITO_CLIENT_ID': cfg['cognito']['client_id'],
         'COGNITO_REGION': cfg['cognito']['region'],
+        'ADMIN_GROUP': cfg['cognito']['admin_group'],
         'TARGET_REGIONS': ','.join(cfg['accounts']['primary']['regions']),
         'MAX_ENTRIES': str(cfg.get('max_entries', 20)),
         'MAX_PREFIX_LEN': str(cfg.get('max_prefix_len', 16)),
@@ -211,7 +214,46 @@ def _project_version():
 # Infrastructure helpers
 # ---------------------------------------------------------------------------
 
-def ensure_target_role(cfg, lambda_role_arn):
+def _trust_policy(lambda_role_arns):
+    return {
+        'Version': '2012-10-17',
+        'Statement': [{
+            'Effect': 'Allow',
+            'Principal': {'AWS': sorted(lambda_role_arns)},
+            'Action': 'sts:AssumeRole',
+        }],
+    }
+
+
+def _trusted_principals(role):
+    principals = set()
+    for st in role['AssumeRolePolicyDocument'].get('Statement', []):
+        aws = st.get('Principal', {}).get('AWS', [])
+        principals.update([aws] if isinstance(aws, str) else aws)
+    return principals
+
+
+def ensure_target_trust(lambda_role_arns):
+    """Make the secondary account's role trust every deployed Lambda role.
+
+    Each Chalice function gets its own role, so adding one (the expiry sweep) means
+    a new principal must be trusted before it can reach the secondary account.
+    Runs on every deploy; writes only when a deployed role is missing.
+    """
+    iam = boto3.Session(profile_name='lab').client('iam')
+    try:
+        role = iam.get_role(RoleName=ROLE_NAME)['Role']
+    except iam.exceptions.NoSuchEntityException:
+        print(f'  IAM role {ROLE_NAME} not found — run --init to create it')
+        return
+    if set(lambda_role_arns) <= _trusted_principals(role):
+        print(f'  {ROLE_NAME} already trusts all {len(lambda_role_arns)} Lambda roles')
+        return
+    iam.update_assume_role_policy(RoleName=ROLE_NAME, PolicyDocument=json.dumps(_trust_policy(lambda_role_arns)))
+    print(f'  {ROLE_NAME} trust updated to {", ".join(sorted(lambda_role_arns))}')
+
+
+def ensure_target_role(cfg, lambda_role_arns):
     secondary = cfg['accounts']['secondary']
     iam = boto3.Session(profile_name='lab').client('iam')
 
@@ -221,14 +263,7 @@ def ensure_target_role(cfg, lambda_role_arn):
     except iam.exceptions.NoSuchEntityException:
         role_exists = False
 
-    trust_policy = {
-        'Version': '2012-10-17',
-        'Statement': [{
-            'Effect': 'Allow',
-            'Principal': {'AWS': lambda_role_arn},
-            'Action': 'sts:AssumeRole',
-        }],
-    }
+    trust_policy = _trust_policy(lambda_role_arns)
     permissions_policy = {
         'Version': '2012-10-17',
         'Statement': [
@@ -389,17 +424,20 @@ def main():
     if 'deploy' in steps:
         step += 1
         print(f'[{step}/{total}] Deploying chalice app...')
-        role_arn, _ = chalice_deploy(cfg)
-        ensure_log_retention(cfg)
+        role_arns, function_names = chalice_deploy(cfg)
+        ensure_log_retention(cfg, function_names)
+        if 'iam' not in steps:
+            ensure_target_trust(role_arns)
         print()
 
     iam_changed = False
     if 'iam' in steps:
         step += 1
         print(f'[{step}/{total}] Ensuring IAM target role in secondary account...')
-        if not role_arn:
-            sys.exit('Could not parse Lambda role ARN from chalice deploy output')
-        iam_changed = ensure_target_role(cfg, role_arn)
+        if not role_arns:
+            sys.exit('Could not parse Lambda role ARNs from chalice deploy output')
+        iam_changed = ensure_target_role(cfg, role_arns)
+        ensure_target_trust(role_arns)
         # IAM change lands after deploy, so the running Lambda still holds STS creds
         # signed under the old policy — bounce it before sync uses those creds.
         if iam_changed:

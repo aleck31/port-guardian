@@ -7,8 +7,9 @@ and the diff and sync used to make replica lists match the primary.
 
 import ipaddress
 import os
+import re
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import boto3
 import requests
@@ -267,11 +268,58 @@ def covers(entries, ip):
 
 
 PIN_MARKER = '[PIN]'
+GUARD_MARKER = '[Guard]'
+# Lifetimes offered when adding or editing; 0 means no expiry (FIFO or a pin decides).
+LIFETIME_DAYS = (0, 1, 7, 30, 90, 180)
+# Expiry dates are calendar days in the users' timezone (CN/HK/SG): a UTC day would
+# start at 08:00 local and make an evening "1 day" entry expire the next morning.
+EXPIRY_TZ = timezone(timedelta(hours=8))
+
+_EXP_RE = re.compile(r'\[EXP:(\d{4}-\d{2}-\d{2})\]')
+_TS_RE = re.compile(r'\s*\b\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2})?Z?)?$')
 
 
 def is_pinned(description):
     """A pinned entry (description contains [PIN]) is never FIFO-evicted."""
     return PIN_MARKER in (description or '')
+
+
+def today_local():
+    return datetime.now(EXPIRY_TZ).date()
+
+
+def parse_description(description):
+    """Split a description into its markers, trailing creation time and free text.
+
+    Format: '[PIN] [Guard] [EXP:YYYY-MM-DD] <label> <ISO timestamp>', every part
+    optional. [Guard] is written only by Port Guardian, so its absence reliably
+    marks an entry added some other way; its presence proves nothing, since a hand
+    edit can copy it.
+    """
+    desc = description or ''
+    exp = _EXP_RE.search(desc)
+    rest = _EXP_RE.sub('', desc).replace(PIN_MARKER, '').replace(GUARD_MARKER, '')
+    ts = _TS_RE.search(rest)
+    return {
+        'pinned': PIN_MARKER in desc,
+        'guard': GUARD_MARKER in desc,
+        'expires': date.fromisoformat(exp.group(1)) if exp else None,
+        'added': ts.group(0).strip() if ts else None,
+        'label': ' '.join(rest[:ts.start()].split() if ts else rest.split()),
+    }
+
+
+def build_description(pinned=False, guard=True, expires=None, label='', added=None):
+    parts = [PIN_MARKER if pinned else '', GUARD_MARKER if guard else '',
+             f'[EXP:{expires.isoformat()}]' if expires else '', label or '', added or '']
+    return ' '.join(p for p in parts if p)[:255]  # AWS description limit
+
+
+def expiry_for(lifetime_days, today=None):
+    """Last valid day for a lifetime in days, or None for no expiry."""
+    if lifetime_days not in LIFETIME_DAYS:
+        raise ValueError(f'lifetime must be one of {LIFETIME_DAYS} days')
+    return (today or today_local()) + timedelta(days=lifetime_days) if lifetime_days else None
 
 
 def _parse_entry_timestamp(description):
@@ -321,30 +369,19 @@ def _entry(cidr, description):
     return {'Cidr': cidr, 'Description': description} if description else {'Cidr': cidr}
 
 
-def add_ip_to_prefix_list(ec2_client, prefix_list_id, ip):
-    """Add the whitelist block for ip, FIFO-evicting the oldest unpinned entry if full.
+def _add_entry(ec2_client, prefix_list_id, pl, entries, cidr, description):
+    """Add one entry, FIFO-evicting the oldest unpinned entry if the list is full.
 
-    Returns (status, entries): 'added' or 'already_exists', and the list's contents
-    afterwards. Eviction triggers at the CONFIGURED threshold (decoupled from the
-    PL's real MaxEntries). If config exceeds the real capacity and the add fails,
-    learn the real value for subsequent calls and raise a clear error for this one.
+    Returns the entries afterwards. Eviction triggers at the CONFIGURED threshold
+    (decoupled from the PL's real MaxEntries). If config exceeds the real capacity
+    and the add fails, learn the real value for subsequent calls and raise a clear
+    error for this one.
     """
-    pl, entries = _read_list(ec2_client, prefix_list_id)
-    if covers(entries, ip):
-        return 'already_exists', entries
-
-    rdap = _fetch_rdap(ip)
-    cidr = _rdap_cidr(rdap, ip)
-    country = (rdap or {}).get('country', 'unknown') or 'unknown'
-    isp = ' '.join(_rdap_org(rdap).split()[:2])  # e.g. 'China Mobile Peoples Telephone...' -> 'China Mobile'
-    ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-    description = f'[Guard] {country} {isp} {ts}'.replace('  ', ' ')
     threshold = _eviction_threshold(prefix_list_id)
-
     modify_args = {
         'PrefixListId': prefix_list_id,
         'CurrentVersion': pl['Version'],
-        'AddEntries': [{'Cidr': cidr, 'Description': description}],
+        'AddEntries': [_entry(cidr, description)],
     }
     evicted = None
     if len(entries) >= threshold:
@@ -370,8 +407,113 @@ def add_ip_to_prefix_list(ec2_client, prefix_list_id, ip):
                 f'({real_max}); now using {real_max} — retry the add'
             )
         raise
-    kept = [e for e in entries if e['Cidr'] != evicted]
-    return 'added', kept + [{'Cidr': cidr, 'Description': description}]
+    return [e for e in entries if e['Cidr'] != evicted] + [_entry(cidr, description)]
+
+
+def _now_stamp():
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def _clean_label(label):
+    """User-supplied text without anything that would read as a marker or a timestamp."""
+    text = _EXP_RE.sub('', label or '').replace(PIN_MARKER, '').replace(GUARD_MARKER, '')
+    return ' '.join(_TS_RE.sub('', text).split())[:120]
+
+
+def add_ip_to_prefix_list(ec2_client, prefix_list_id, ip, lifetime_days=0):
+    """Add the whitelist block for ip. Returns (status, entries afterwards).
+
+    Status is 'added', or 'already_exists' when an entry already covers ip.
+    """
+    pl, entries = _read_list(ec2_client, prefix_list_id)
+    if covers(entries, ip):
+        return 'already_exists', entries
+
+    expires = expiry_for(lifetime_days)
+    rdap = _fetch_rdap(ip)
+    cidr = _rdap_cidr(rdap, ip)
+    country = (rdap or {}).get('country', 'unknown') or 'unknown'
+    isp = ' '.join(_rdap_org(rdap).split()[:2])  # e.g. 'China Mobile Peoples Telephone...' -> 'China Mobile'
+    description = build_description(expires=expires, label=f'{country} {isp}', added=_now_stamp())
+    return 'added', _add_entry(ec2_client, prefix_list_id, pl, entries, cidr, description)
+
+
+def normalize_cidr(text):
+    """A public IPv4 CIDR no wider than WIDEST_PREFIX_LEN, host bits cleared."""
+    try:
+        net = ipaddress.ip_network((text or '').strip(), strict=False)
+    except ValueError:
+        raise ValueError(f'not a valid CIDR: {text!r}')
+    if net.version != 4:
+        raise ValueError('only IPv4 CIDRs are supported')
+    if not net.is_global:
+        raise ValueError(f'{net} is not a public address range')
+    if net.prefixlen < WIDEST_PREFIX_LEN:
+        raise ValueError(f'{net} is wider than /{WIDEST_PREFIX_LEN}')
+    return str(net)
+
+
+def add_cidr_to_prefix_list(ec2_client, prefix_list_id, cidr, label, lifetime_days=0, pinned=False):
+    """Add an arbitrary CIDR with a description. Returns (status, entries afterwards)."""
+    cidr = normalize_cidr(cidr)
+    expires = None if pinned else expiry_for(lifetime_days)
+    pl, entries = _read_list(ec2_client, prefix_list_id)
+    if any(e['Cidr'] == cidr for e in entries):
+        raise ValueError(f'{cidr} is already in the list — edit it instead')
+    description = build_description(pinned=pinned, expires=expires, label=_clean_label(label), added=_now_stamp())
+    return 'added', _add_entry(ec2_client, prefix_list_id, pl, entries, cidr, description)
+
+
+_KEEP = object()
+
+
+def update_entry(ec2_client, prefix_list_id, cidr, label=_KEEP, expires=_KEEP):
+    """Rewrite an entry's label and/or expiry date (None = never). Returns (status, entries afterwards).
+
+    Saving through Port Guardian adopts the entry: it gains [Guard], so an entry
+    added some other way stops being flagged once someone has reviewed it here.
+    A pinned entry never expires, so an expiry is ignored for it. A date before
+    today is refused: the next sweep would delete the entry immediately.
+    """
+    if expires is not _KEEP and expires is not None and expires < today_local():
+        raise ValueError(f'expiry {expires} is in the past')
+    pl, entries = _read_list(ec2_client, prefix_list_id)
+    entry = next((e for e in entries if e['Cidr'] == cidr), None)
+    if entry is None:
+        raise ValueError(f'{cidr} not found in prefix list')
+    d = parse_description(entry.get('Description', ''))
+    expires = d['expires'] if expires is _KEEP else expires
+    new_desc = build_description(
+        pinned=d['pinned'], expires=None if d['pinned'] else expires,
+        label=d['label'] if label is _KEEP else _clean_label(label), added=d['added'],
+    )
+    if new_desc == entry.get('Description', ''):
+        return 'unchanged', entries
+    ec2_client.modify_managed_prefix_list(
+        PrefixListId=prefix_list_id, CurrentVersion=pl['Version'], AddEntries=[_entry(cidr, new_desc)],
+    )
+    return 'updated', [_entry(cidr, new_desc) if e['Cidr'] == cidr else e for e in entries]
+
+
+def expired(entries, today=None):
+    """Unpinned entries whose last valid day is before today."""
+    today = today or today_local()
+    return [e['Cidr'] for e in entries
+            if (d := parse_description(e.get('Description', '')))['expires']
+            and not d['pinned'] and d['expires'] < today]
+
+
+def remove_expired(ec2_client, prefix_list_id, today=None):
+    """Remove every expired entry in one call. Returns (status, entries afterwards)."""
+    pl, entries = _read_list(ec2_client, prefix_list_id)
+    gone = expired(entries, today)
+    if not gone:
+        return 'nothing expired', entries
+    ec2_client.modify_managed_prefix_list(
+        PrefixListId=prefix_list_id, CurrentVersion=pl['Version'],
+        RemoveEntries=[{'Cidr': c} for c in gone],
+    )
+    return f'removed {len(gone)} expired: {", ".join(gone)}', [e for e in entries if e['Cidr'] not in gone]
 
 
 def get_all_entries(ec2_client, prefix_list_id):
@@ -399,9 +541,10 @@ def remove_cidr_from_prefix_list(ec2_client, prefix_list_id, cidr):
 def set_pin(ec2_client, prefix_list_id, cidr, pinned):
     """Add or remove the [PIN] marker on a CIDR's description.
 
-    Returns (status, entries afterwards). There is no rename API, but AddEntries
-    with an already-present CIDR overwrites its Description in place (verified
-    against a live prefix list), so this is one call with no RemoveEntries.
+    Returns (status, entries afterwards). Pinning also clears any expiry: a pinned
+    entry is kept until someone unpins or deletes it. There is no rename API, but
+    AddEntries with an already-present CIDR overwrites its Description in place
+    (verified against a live prefix list), so this is one call with no RemoveEntries.
     """
     pl, entries = _read_list(ec2_client, prefix_list_id)
     entry = next((e for e in entries if e['Cidr'] == cidr), None)
@@ -409,12 +552,12 @@ def set_pin(ec2_client, prefix_list_id, cidr, pinned):
         raise ValueError(f'{cidr} not found in prefix list')
 
     desc = entry.get('Description', '')
-    if pinned and not is_pinned(desc):
-        new_desc = f'{PIN_MARKER} {desc}'.strip()
-    elif not pinned and is_pinned(desc):
-        new_desc = ' '.join(desc.replace(PIN_MARKER, '').split())
-    else:
-        return ('pinned' if pinned else 'unpinned'), entries
+    d = parse_description(desc)
+    status = 'pinned' if pinned else 'unpinned'
+    if d['pinned'] == pinned:
+        return status, entries
+    new_desc = build_description(pinned=pinned, guard=d['guard'], expires=None if pinned else d['expires'],
+                                 label=d['label'], added=d['added'])
 
     ec2_client.modify_managed_prefix_list(
         PrefixListId=prefix_list_id,
@@ -422,7 +565,7 @@ def set_pin(ec2_client, prefix_list_id, cidr, pinned):
         AddEntries=[_entry(cidr, new_desc)],
     )
     after = [_entry(cidr, new_desc) if e['Cidr'] == cidr else e for e in entries]
-    return ('pinned' if pinned else 'unpinned'), after
+    return status, after
 
 
 def diff_entries(desired, actual):

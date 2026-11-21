@@ -51,6 +51,8 @@ input:focus{outline:none;border-color:#0066cc}
 .btn-icon:hover{background:#f0f2f5}
 .btn-icon svg{display:block}
 .hidden{display:none}
+.field-label{display:block;font-size:.8rem;color:#666;margin-bottom:.25rem}
+.lifetime-select{padding:.35rem .5rem;border:1px solid #ddd;border-radius:6px;font-size:.8rem;background:#fff;color:#333}
 #overlay{position:fixed;inset:0;background:rgba(0,0,0,.4);display:none;align-items:center;justify-content:center;z-index:999}
 #overlay .spinner{width:2.5rem;height:2.5rem;border-width:4px;border-color:rgba(255,255,255,.3);border-top-color:#fff;margin:0}
 @media(min-width:480px){body{padding:2rem}header h1{font-size:1.75rem}}
@@ -90,6 +92,41 @@ input:focus{outline:none;border-color:#0066cc}
     </div>
   </div>
 </div>
+<div id="entry-modal" style="position:fixed;inset:0;background:rgba(0,0,0,.4);display:none;align-items:center;justify-content:center;z-index:998" onclick="if(event.target===this)closeEntryModal()">
+  <form onsubmit="saveEntry(event)" style="background:#fff;border-radius:12px;max-width:460px;width:92%;padding:1.5rem">
+    <h2 id="entry-modal-title" style="margin-bottom:1rem">Add entry</h2>
+    <label class="field-label" for="entry-cidr">CIDR</label>
+    <input type="text" id="entry-cidr" placeholder="e.g. 52.220.80.179 or 54.240.199.96/28" autocomplete="off" required oninput="updateEntryHint()">
+    <div id="entry-cidr-hint" style="font-size:.75rem;color:#888;margin:-.5rem 0 .75rem"></div>
+    <div id="entry-ip-note" style="display:none;font-size:.8rem;color:#888;margin-bottom:.75rem">The block your current IP belongs to. The description is filled in from RDAP (country and ISP).</div>
+    <div id="entry-label-row">
+      <label class="field-label" for="entry-label">Description</label>
+      <input type="text" id="entry-label" placeholder="What this address is, e.g. office VPN egress" maxlength="120" autocomplete="off">
+    </div>
+    <label class="field-label" id="entry-expires-label" for="entry-lifetime">Expires</label>
+    <select id="entry-lifetime" class="lifetime-select" style="width:100%;margin-bottom:.75rem"></select>
+    <div id="entry-date-row" style="display:none;margin-bottom:.75rem">
+      <div style="display:flex;align-items:center;gap:.75rem;flex-wrap:wrap">
+        <input type="date" id="entry-expires" class="lifetime-select" style="flex:1;min-width:9rem" title="Last valid day (UTC+8); removed by the daily sweep after it">
+        <label style="display:flex;align-items:center;gap:.35rem;font-size:.85rem;color:#666;cursor:pointer;white-space:nowrap">
+          <input type="checkbox" id="entry-never" style="width:auto;margin:0" onchange="document.getElementById('entry-expires').disabled = this.checked">
+          Never expires
+        </label>
+      </div>
+      <div style="font-size:.75rem;color:#888;margin-top:.25rem">Valid through this day (UTC+8), then removed by the daily sweep.</div>
+    </div>
+    <label id="entry-pin-row" style="display:flex;align-items:center;gap:.5rem;font-size:.85rem;color:#666;margin-bottom:.75rem;cursor:pointer">
+      <input type="checkbox" id="entry-pin" style="width:auto;margin:0" onchange="document.getElementById('entry-lifetime').disabled = this.checked">
+      Pin — never expires and never auto-evicted
+    </label>
+    <div id="entry-pinned-note" style="display:none;font-size:.8rem;color:#888;margin-bottom:.75rem">Pinned entries never expire. Unpin it to set an expiry.</div>
+    <div id="entry-error" style="color:#721c24;font-size:.8rem;margin-bottom:.75rem;display:none"></div>
+    <div style="display:flex;gap:.5rem;justify-content:flex-end">
+      <button type="button" class="btn-sm" style="background:#9ca3af;padding:.45rem 1rem;font-size:.85rem" onclick="closeEntryModal()">Cancel</button>
+      <button type="submit" id="entry-save" class="btn-sm" style="background:#0066cc;padding:.45rem 1rem;font-size:.85rem">Save</button>
+    </div>
+  </form>
+</div>
 <div class="container">
   <header>
     <h1>🛡️ Port Guardian</h1>
@@ -127,7 +164,7 @@ input:focus{outline:none;border-color:#0066cc}
         <div id="ip-info" style="font-size:.8rem;color:#888;margin-top:.5rem;line-height:1.6"></div>
       </div>
       <div style="flex-shrink:0;padding-top:1.5rem">
-        <button id="update-btn" class="btn btn-primary" onclick="updateWhitelist()" disabled style="width:auto;padding:.6rem 1.2rem;font-size:.9rem;opacity:.4">Add</button>
+        <button id="update-btn" class="btn btn-primary" onclick="openEntryModal(null, 'ip')" disabled style="width:auto;padding:.6rem 1.2rem;font-size:.9rem;opacity:.4">Add</button>
       </div>
     </div>
     <div id="result" style="margin-bottom:.75rem;padding:.75rem;border-radius:8px;font-size:.875rem;display:none;white-space:pre-line"></div>
@@ -144,7 +181,11 @@ input:focus{outline:none;border-color:#0066cc}
       <div id="ports-info" style="font-size:.85rem;color:#888;margin-top:1rem"><button class="btn-sm" style="background:#3b82f6;margin-right:.5rem" onclick="openSgModal()">Managed SGs</button>Ports are managed per security group via its <code>port-guardian</code> tag (e.g. <code>port-guardian=22,8443</code>).</div>
     </div>
     <div class="card">
-      <h2>Whitelist Entries<span id="entries-count" style="color:#999;font-weight:400"></span></h2>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:.5rem">
+        <h2 style="margin:0">Whitelist Entries<span id="entries-count" style="color:#999;font-weight:400"></span></h2>
+        <button id="add-cidr-btn" class="btn-sm" style="background:#0066cc;display:none" onclick="openEntryModal()">+ Add entry</button>
+      </div>
+      <div id="readonly-note" style="display:none;margin-top:.5rem;font-size:.8rem;color:#888">Read-only: changes need the admin group.</div>
       <div id="drift-banner" style="margin-top:.75rem;padding:.6rem .75rem;border-radius:8px;background:#fef3c7;color:#92400e;font-size:.85rem;display:none;align-items:center;justify-content:space-between;gap:.75rem;flex-wrap:wrap">
         <span id="drift-text"></span>
         <button class="btn-sm" style="background:#b45309" onclick="openListSyncModal()">Review sync</button>
@@ -341,6 +382,7 @@ async function fetchIp() {
 async function fetchIpInfo() {
   try {
     const d = await apiFetch('/ipinfo');
+    _ipInfo = d;
     const ip = document.getElementById('current-ip');
     if (d.country) ip.innerHTML = d.ip + ' <span style="font-size:.75rem;color:#999">(' + d.country + ')</span>';
     const lines = [];
@@ -414,9 +456,10 @@ async function fetchStatus() {
       }).join('') + '</tr>'
     ).join('');
     _listCount = data.list_count || 0;
+    applyPermissions(data);
     renderEntries(data.entries || []);
     renderDrift(data);
-    const needsUpdate = data.regions.some(r => !r.in_prefix_list);
+    const needsUpdate = _canWrite && data.regions.some(r => !r.in_prefix_list);
     const btn = document.getElementById('update-btn');
     btn.disabled = !needsUpdate;
     btn.style.opacity = needsUpdate ? '1' : '.4';
@@ -451,35 +494,58 @@ function addrCountBadge(cidr) {
     + n.toLocaleString() + ')</span>';
 }
 
-// Split a raw entry description into {when, label}: pull out the ISO timestamp,
-// leave the human-readable remainder (country / marker) as the label.
+// Entries are shown parsed: markers as icons/tags, creation and expiry as columns.
+// Split a raw entry description into its parts; mirrors parse_description() in the
+// backend. Markers ([PIN], [Guard], [EXP:...]) and the creation time are shown as
+// icons, tags and columns, never as raw text.
+const TS_RE = /\s*\b(\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2})?Z?)?)$/;
 function parseEntryDesc(desc) {
   desc = desc || '';
-  const m = desc.match(/(\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?Z?)?)/);
+  const exp = desc.match(/\[EXP:(\d{4}-\d{2}-\d{2})\]/);
+  let rest = desc.replace(/\[EXP:\d{4}-\d{2}-\d{2}\]/g, '').replace(/\[PIN\]/g, '').replace(/\[Guard\]/g, '');
+  const m = rest.match(TS_RE);
   let when = '';
   if (m) {
-    const d = new Date(m[1].replace(' ', 'T').replace(/Z?$/, 'Z'));
+    const d = new Date(m[1].length === 10 ? m[1] + 'T00:00:00Z' : m[1].replace(/Z?$/, 'Z'));
     // Fixed local-time format YYYY-MM-DD HH:mm, independent of browser locale
     if (!isNaN(d)) {
       const p2 = n => String(n).padStart(2, '0');
       when = d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate()) +
              ' ' + p2(d.getHours()) + ':' + p2(d.getMinutes());
     }
+    rest = rest.slice(0, m.index);
   }
-  const pinned = desc.includes('[PIN]');
-  // Keep [Guard] (marks system-added entries; absence means manually created) — only
-  // strip [PIN] (shown separately as an icon) and the timestamp.
-  const label = desc
-    .replace(/\[PIN\]/g, '')
-    .replace(/\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?Z?)?/, '')
-    .replace(/\s+/g, ' ').trim();
-  return { when, label, pinned };
+  return {
+    when, pinned: desc.includes('[PIN]'), guard: desc.includes('[Guard]'),
+    expires: exp ? exp[1] : '', label: rest.replace(/\s+/g, ' ').trim(),
+  };
+}
+
+// Today in UTC+8, the timezone expiry dates are written in (EXPIRY_TZ in the backend).
+function todayLocal() { return new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 10); }
+function daysUntil(isoDate) { return Math.round((Date.parse(isoDate) - Date.parse(todayLocal())) / 86400e3); }
+
+function expiryCell(p) {
+  if (p.pinned || !p.expires) return '<span style="color:#bbb">—</span>';
+  const left = daysUntil(p.expires);
+  const color = left <= 1 ? '#dc2626' : left <= 7 ? '#b45309' : '#888';
+  const hint = left < 0 ? 'expired, removed at the next daily sweep' : left === 0 ? 'last day' : left + ' day' + (left > 1 ? 's' : '') + ' left';
+  return '<span style="color:' + color + '" title="Valid through ' + p.expires + ' (UTC+8): ' + hint + '">' + p.expires + '</span>';
+}
+
+// [Guard] is written only by Port Guardian, so an entry without it was added some other way.
+function externalTag(p) {
+  if (p.guard) return '';
+  const why = 'Not added through Port Guardian.' + (p.pinned ? '' : ' Unpinned entries without a timestamp are evicted first.') +
+              ' Edit it here to adopt it.';
+  return ' <span style="font-size:.7rem;padding:0 .3rem;border-radius:4px;background:#f3f4f6;color:#6b7280" title="' + why + '">external</span>';
 }
 
 // Inline SVG icons (Feather-style, no CDN dependency)
 const ICON_PIN = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 3h6l1 7 2 2v2H6v-2l2-2z"/></svg>';
 const ICON_PIN_FILLED = '<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 3h6l1 7 2 2v2H6v-2l2-2z"/></svg>';
 const ICON_TRASH = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>';
+const ICON_EDIT = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>';
 
 let _entries = [], _timeSortDir = 0; // 0 = server order, -1 = newest first, 1 = oldest first
 
@@ -501,20 +567,135 @@ function renderEntries(entries) {
     rows.sort((a, b) => !a.p.when - !b.p.when || _timeSortDir * a.p.when.localeCompare(b.p.when));
   }
   const arrow = _timeSortDir === -1 ? ' ▼' : _timeSortDir === 1 ? ' ▲' : '';
+  const off = _canWrite ? '' : ' disabled style="opacity:.35;cursor:not-allowed"';
   // Scroll the table, not the page: CIDR + timestamp + label can't fit a phone width.
   body.innerHTML = '<div style="overflow-x:auto"><table style="width:100%"><thead><tr><th>CIDR</th>' +
     '<th style="cursor:pointer;user-select:none" onclick="sortEntriesByTime()" title="Sort by time">Added At' + arrow + '</th>' +
+    '<th title="Valid through this day (UTC+8); removed by the daily sweep after it">Expires</th>' +
     '<th>Description</th><th></th></tr></thead><tbody>' +
     rows.map(({ e, p }) =>
-      '<tr><td>' + esc(e.cidr) + addrCountBadge(e.cidr) + (p.pinned ? ' <span title="Pinned — never auto-evicted">📌</span>' : '') + coverageBadge(e) + '</td>' +
+      '<tr><td>' + esc(e.cidr) + addrCountBadge(e.cidr) + (p.pinned ? ' <span title="Pinned — never expires or auto-evicted">📌</span>' : '') +
+          externalTag(p) + coverageBadge(e) + '</td>' +
         '<td style="color:#888;font-size:.8rem;white-space:nowrap">' + (p.when || '—') + '</td>' +
+        '<td style="font-size:.8rem;white-space:nowrap">' + expiryCell(p) + '</td>' +
         '<td style="color:#888;font-size:.8rem">' + esc(p.label) + '</td>' +
         '<td style="text-align:right;white-space:nowrap">' +
-        '<button class="btn-icon" style="color:' + (p.pinned ? '#0066cc' : '#999') + '" title="' + (p.pinned ? 'Unpin' : 'Pin — never auto-evict') +
-          '" onclick="togglePin(\'' + e.cidr + '\', ' + !p.pinned + ')">' + (p.pinned ? ICON_PIN_FILLED : ICON_PIN) + '</button>' +
-        '<button class="btn-icon" style="color:#ef4444" title="Delete" onclick="deleteEntry(\'' + e.cidr + '\')">' + ICON_TRASH + '</button>' +
+        '<button class="btn-icon" style="color:#999" title="Edit description or expiry" onclick="openEntryModal(\'' + e.cidr + '\')"' + off + '>' + ICON_EDIT + '</button>' +
+        '<button class="btn-icon" style="color:' + (p.pinned ? '#0066cc' : '#999') + '" title="' + (p.pinned ? 'Unpin' : 'Pin — never expires or auto-evicted') +
+          '" onclick="togglePin(\'' + e.cidr + '\', ' + !p.pinned + ')"' + off + '>' + (p.pinned ? ICON_PIN_FILLED : ICON_PIN) + '</button>' +
+        '<button class="btn-icon" style="color:#ef4444" title="Delete" onclick="deleteEntry(\'' + e.cidr + '\')"' + off + '>' + ICON_TRASH + '</button>' +
         '</td></tr>'
     ).join('') + '</tbody></table></div>';
+}
+
+// --- Lifetimes, add/edit modal, read-only mode ---
+let _canWrite = false, _lifetimes = [0, 1, 7, 30, 90, 180];
+const lifetimeLabel = d => d === 0 ? 'Never expires' : d + (d === 1 ? ' day' : ' days');
+
+function fillLifetimes(select) {
+  select.innerHTML = _lifetimes.map(d => '<option value="' + d + '">' + lifetimeLabel(d) + '</option>').join('');
+}
+
+function applyPermissions(data) {
+  _canWrite = !!data.can_write;
+  if (Array.isArray(data.lifetimes) && data.lifetimes.length) _lifetimes = data.lifetimes;
+  document.getElementById('add-cidr-btn').style.display = _canWrite ? '' : 'none';
+  document.getElementById('readonly-note').style.display = _canWrite ? 'none' : '';
+  const syncBtn = document.querySelector('#drift-banner button');
+  if (syncBtn) syncBtn.textContent = _canWrite ? 'Review sync' : 'View differences';
+}
+
+// One dialog for three jobs: 'ip' adds the caller's own IP (POST /update; the backend
+// picks the block and description), 'add' adds any CIDR, 'edit' changes an entry.
+let _editing = null, _entryMode = 'add', _ipInfo = null;
+
+function openEntryModal(cidr, mode) {
+  _entryMode = mode || (cidr ? 'edit' : 'add');
+  _editing = _entryMode === 'edit' ? cidr : null;
+  const e = _editing ? _entries.find(x => x.cidr === cidr) : null;
+  const p = e ? parseEntryDesc(e.description) : null;
+  const isIp = _entryMode === 'ip';
+  document.getElementById('entry-modal-title').textContent =
+    isIp ? 'Add your current IP' : e ? 'Edit ' + cidr : 'Add entry';
+  const cidrInput = document.getElementById('entry-cidr');
+  cidrInput.value = isIp ? ((_ipInfo && _ipInfo.cidr) || document.getElementById('current-ip').textContent.split(' ')[0])
+                         : e ? cidr : '';
+  cidrInput.readOnly = isIp || !!e;
+  document.getElementById('entry-ip-note').style.display = isIp ? '' : 'none';
+  document.getElementById('entry-label-row').style.display = isIp ? 'none' : '';
+  document.getElementById('entry-label').value = p ? p.label : '';
+  // Adding picks a duration; editing sets an exact last day (or none).
+  const sel = document.getElementById('entry-lifetime');
+  fillLifetimes(sel);
+  sel.disabled = false;
+  sel.style.display = e ? 'none' : '';
+  document.getElementById('entry-expires-label').style.display = e && p.pinned ? 'none' : '';
+  const dateRow = document.getElementById('entry-date-row');
+  dateRow.style.display = e && !p.pinned ? '' : 'none';
+  const dateInput = document.getElementById('entry-expires');
+  dateInput.min = todayLocal();
+  dateInput.value = p && p.expires ? p.expires : '';
+  document.getElementById('entry-never').checked = !!e && !p.expires;
+  dateInput.disabled = !!e && !p.expires;
+  document.getElementById('entry-pin-row').style.display = _entryMode === 'add' ? 'flex' : 'none';
+  document.getElementById('entry-pin').checked = false;
+  document.getElementById('entry-pinned-note').style.display = p && p.pinned ? '' : 'none';
+  document.getElementById('entry-error').style.display = 'none';
+  document.getElementById('entry-save').textContent = e ? 'Save' : 'Add';
+  updateEntryHint();
+  document.getElementById('entry-modal').style.display = 'flex';
+  (isIp ? sel : e ? document.getElementById('entry-label') : cidrInput).focus();
+}
+
+function closeEntryModal() { document.getElementById('entry-modal').style.display = 'none'; }
+
+function updateEntryHint() {
+  const v = document.getElementById('entry-cidr').value.trim();
+  const cidr = v && !v.includes('/') ? v + '/32' : v;
+  document.getElementById('entry-cidr-hint').textContent = addrCountLabel(cidr) ? 'Grants ' + addrCountLabel(cidr) : '';
+}
+
+async function saveEntry(ev) {
+  ev.preventDefault();
+  const err = document.getElementById('entry-error');
+  const btn = document.getElementById('entry-save');
+  const isIp = _entryMode === 'ip';
+  const body = { cidr: document.getElementById('entry-cidr').value.trim(), label: document.getElementById('entry-label').value };
+  if (_editing) {
+    const p = parseEntryDesc((_entries.find(x => x.cidr === _editing) || {}).description);
+    if (!p.pinned) {
+      const never = document.getElementById('entry-never').checked;
+      const day = document.getElementById('entry-expires').value;
+      if (!never && !day) { err.textContent = 'Pick an expiry date, or tick Never expires.'; err.style.display = 'block'; return; }
+      body.expires = never ? null : day;
+    }
+  } else {
+    body.lifetime_days = Number(document.getElementById('entry-lifetime').value || 0);
+  }
+  if (_entryMode === 'add') body.pinned = document.getElementById('entry-pin').checked;
+  err.style.display = 'none';
+  btn.disabled = true;
+  try {
+    const data = isIp
+      ? await apiFetch('/update', { method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ lifetime_days: body.lifetime_days || 0 }) })
+      : await apiFetch('/entries', { method: _editing ? 'PATCH' : 'POST',
+          headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
+    const primary = data.results[0] || {};
+    if (isFailure(primary.status)) {   // nothing was written anywhere; keep the form open to fix it
+      err.textContent = String(primary.status).replace(/^error: /, '');
+      err.style.display = 'block';
+      return;
+    }
+    closeEntryModal();
+    showResults(isIp ? 'Add ' + (data.ip || 'current IP') : (_editing ? 'Edit ' : 'Add ') + body.cidr, data.results);
+    await fetchStatus();
+  } catch (e) {
+    err.textContent = e.message;
+    err.style.display = 'block';
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 function showOverlay() { document.getElementById('overlay').style.display = 'flex'; }
@@ -586,10 +767,14 @@ function renderListSync(d, preview) {
   const body = document.getElementById('list-sync-body');
   if (d.error) { body.innerHTML = '<span style="color:#dc2626">' + esc(d.error) + '</span>'; return; }
   // One line per added/removed CIDR, with its description: a bare CIDR says nothing about what it is.
-  const lines = (cidrs, sign, color, verb, descs) => (cidrs || []).map(c =>
-    '<div style="margin:.15rem 0 .45rem" title="' + verb + '">' +
-      '<div style="color:' + color + '">' + sign + ' ' + esc(c) + addrCountBadge(c) + '</div>' +
-      '<div style="color:#888;padding-left:1rem;font-size:.75rem">' + (esc(descs[c]) || '<i>no description</i>') + '</div></div>').join('');
+  const lines = (cidrs, sign, color, verb, descs) => (cidrs || []).map(c => {
+    const p = parseEntryDesc(descs[c]);
+    const tags = (p.pinned ? ' 📌' : '') + externalTag(p) + (p.expires && !p.pinned ? ' <span style="font-size:.7rem">expires ' + p.expires + '</span>' : '');
+    return '<div style="margin:.15rem 0 .45rem" title="' + verb + '">' +
+      '<div style="color:' + color + '">' + sign + ' ' + esc(c) + addrCountBadge(c) + tags + '</div>' +
+      '<div style="color:#888;padding-left:1rem;font-size:.75rem">' + (esc(p.label) || '<i>no description</i>') +
+        (p.when ? ' · added ' + p.when : '') + '</div></div>';
+  }).join('');
   body.innerHTML = d.results.map(r => {
     const failed = isFailure(r.status);
     const rewrites = (r.update || []).length
@@ -605,7 +790,7 @@ function renderListSync(d, preview) {
       (changes ? '<div style="font-size:.8rem;margin-top:.2rem">' + changes + '</div>' : '') + lockout + '</div>';
   }).join('');
   const pending = preview && d.results.some(r => r.status === 'out of sync' || r.status === 'descriptions differ');
-  document.getElementById('list-sync-btn').style.display = pending ? '' : 'none';
+  document.getElementById('list-sync-btn').style.display = pending && _canWrite ? '' : 'none';
   document.getElementById('list-sync-btn').disabled = false;
   document.getElementById('list-sync-note').textContent = !preview ? 'Done.'
     : pending ? (d.results.some(r => r.loses_current_ip) ? 'Review the warning above before confirming.' : '')
@@ -756,28 +941,6 @@ async function applySync() {
       loadSgs();
     }
   } catch (e) { note.textContent = 'Failed: ' + e.message; btn.disabled = false; }
-}
-
-async function updateWhitelist() {
-  const btn = document.getElementById('update-btn');
-  const result = document.getElementById('result');
-  btn.disabled = true;
-  btn.style.opacity = '.4';
-  result.className = '';
-  result.style.display = 'none';
-  showOverlay();
-  try {
-    const data = await apiFetch('/update', { method: 'POST' });
-    showResults('', data.results);
-    await fetchStatus();
-  } catch (e) {
-    result.textContent = 'Add failed: ' + e.message;
-    result.className = 'result-err';
-    result.style.display = 'block';
-  } finally {
-    hideOverlay();
-    btn.innerHTML = 'Add';
-  }
 }
 
 async function togglePin(cidr, pinned) {

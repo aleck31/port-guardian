@@ -19,6 +19,8 @@ cognito:
   region: ap-southeast-1
   user_pool_id: ap-southeast-1_XXXXXXXXX
   client_id: xxxxxxxxxxxxxxxxxxxxxxxxx
+  # Only members of this group may change the whitelist or SG rules; any signed-in user can view.
+  admin_group: admin
 
 # SG management is driven by this tag. Its VALUE carries the ports per SG,
 # e.g. `port-guardian=22,8443`. Add/remove ports or unmanage a SG by editing the tag.

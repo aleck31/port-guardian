@@ -8,16 +8,18 @@ Port Guardian provides a web UI where authenticated users can view their current
 
 - **Web UI** — Login, view IP & whitelist status, one-click update, entries management; installable as a PWA (desktop and mobile home screen)
 - **IP info** — Shows ISP, CIDR block, range and country via RDAP, plus how many addresses the block grants
-- **Whitelist entries** — View, pin and delete prefix list entries directly from the UI; blocks of a /16 or wider are highlighted
+- **Whitelist entries** — View, add, edit, pin and delete prefix list entries directly from the UI; blocks of a /16 or wider are highlighted
 - **Multi-account** — Primary account (direct) + secondary account (STS AssumeRole)
 - **Multi-region** — One primary list (primary account, Lambda's region) is the source of truth; each write lands there first and every other list is then made identical to it, so a failed write can't leave the lists diverged
 - **Drift detection** — The UI flags lists that differ from the primary and entries missing from some lists, and previews a sync before applying it
 - **RDAP prefix lookup** — Whitelists the ISP allocation block that contains the IP, clamped to `max_prefix_len` (default /16), instead of a /32, reducing churn. Clients inside AWS's published ranges get a /32: their address is static, and the space around it belongs to other tenants
 - **CIDR containment** — Checks if IP falls within any existing prefix, not just exact match
 - **FIFO eviction** — Auto-removes oldest entry when prefix list is full; pinned entries (see below) are never evicted
-- **Pinned entries** — Mark an entry with the pin icon in the UI to exempt it from FIFO eviction (stored as a `[PIN]` marker in its description); adding a new IP fails with a clear error if the list is full and every entry is pinned
+- **Pinned entries** — Mark an entry with the pin icon in the UI to exempt it from expiry and FIFO eviction (stored as a `[PIN]` marker in its description); adding a new IP fails with a clear error if the list is full and every entry is pinned
+- **Entry lifetime** — Each entry can expire after 1, 7, 30, 90 or 180 days, or never, chosen when adding; editing sets an exact expiry date. A daily job removes expired entries everywhere. Entries that never expire are retired by FIFO or kept with a pin
+- **Manual entries** — Add any public CIDR with a description, and edit an entry's description or expiry from the UI. Entries added outside Port Guardian (console, CLI) are tagged `external`
 - **Tag-driven SG sync** — A `port-guardian=<ports>` tag on a Security Group is the single source of truth for which ports it opens. The UI's Managed SGs modal previews changes (including rules on untagged/"exit" SGs) before applying; removing the tag and confirming the exit unmanages the SG
-- **Cognito auth** — API endpoints protected by Cognito User Pool authorizer; sign-in supports TOTP MFA
+- **Cognito auth** — API endpoints protected by Cognito User Pool authorizer; sign-in supports TOTP MFA. Any signed-in user can view; only members of `cognito.admin_group` can make changes
 
 ## Architecture
 
@@ -72,7 +74,7 @@ cp config.yaml.example config.yaml
 # Edit config.yaml with your account IDs, regions, Cognito settings
 ```
 
-Besides accounts, regions and Cognito, `config.yaml.example` documents `max_entries` (FIFO eviction threshold), `max_prefix_len` (widest block one IP may whitelist) and `lambda.log_retention_days` (CloudWatch retention, applied on deploy).
+Besides accounts, regions and Cognito (including `cognito.admin_group`, the group allowed to make changes), `config.yaml.example` documents `max_entries` (FIFO eviction threshold), `max_prefix_len` (widest block one IP may whitelist) and `lambda.log_retention_days` (CloudWatch retention, applied to every function on deploy).
 
 `app/.chalice/config.json` will be auto-generated from `config.yaml` on first deploy. If you need to change Chalice-specific settings (memory, architecture), edit `config.json.example` and delete `config.json` to regenerate.
 
@@ -130,16 +132,19 @@ To use a custom domain instead of the default API Gateway URL:
 | GET | `/ip` | No | Returns `{"ip": "x.x.x.x"}` |
 | GET | `/ipinfo` | Yes | IP details: org, CIDR, range, country (via RDAP) |
 | GET | `/status` | Yes | IP status across all regions, entries from every list, and drift against the primary list |
-| POST | `/update` | Yes | Add IP to the primary list, then sync the others |
-| DELETE | `/entries` | Yes | Remove a CIDR from the primary list, then sync the others |
-| PATCH | `/entries` | Yes | Pin/unpin a CIDR (`{"cidr": "...", "pinned": true}`) on the primary list, then sync the others |
-| POST | `/sync-entries` | Yes | Make every list match the primary; `{"dry_run": true}` for a preview |
+| POST | `/update` | Admin | Add the caller's IP to the primary list (`{"lifetime_days": 0}`), then sync the others |
+| POST | `/entries` | Admin | Add any public CIDR: `{"cidr", "label", "lifetime_days", "pinned"}` |
+| DELETE | `/entries` | Admin | Remove a CIDR from the primary list, then sync the others |
+| PATCH | `/entries` | Admin | `{"cidr", "pinned"}` pins or unpins; `{"cidr", "label"?, "expires"?}` edits the description or sets the last valid day (`YYYY-MM-DD`, or `null` for never) |
+| POST | `/sync-entries` | Admin* | Make every list match the primary; `{"dry_run": true}` for a preview (*dry run open to any user) |
 | GET | `/sgs` | Yes | Overview of tagged Security Groups per account/region |
-| POST | `/sync-sg` | Yes | Reconcile SG ingress to each SG's `port-guardian` tag; `{"dry_run": true}` for a preview, `{"allow_exit": true}` to also revoke rules on untagged SGs |
+| POST | `/sync-sg` | Admin* | Reconcile SG ingress to each SG's `port-guardian` tag; `{"dry_run": true}` for a preview (*dry run open to any user), `{"allow_exit": true}` to also revoke rules on untagged SGs |
+
+"Yes" means any signed-in user; "Admin" means a member of `cognito.admin_group`.
 
 ## Security
 
-- All mutation endpoints require Cognito authentication
+- All endpoints except the page, `/ip` and the PWA assets require Cognito authentication; changes additionally require the admin group
 - Lambda IAM role follows least-privilege: `ec2:Describe*`/`ec2:Modify*` scoped to `ManagedBy=port-guardian`-tagged prefix lists; `AuthorizeSecurityGroupIngress` requires the `port-guardian` tag, `RevokeSecurityGroupIngress` does not (needed for the SG-sync exit path — see `.dev/AGENTS.md`)
 - Cross-account access via scoped AssumeRole
 - Management ports only open to prefix list IPs — no 0.0.0.0/0 rules

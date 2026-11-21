@@ -2,13 +2,15 @@ import logging
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date
 from pathlib import Path
 
-from chalice import Chalice, CognitoUserPoolAuthorizer, Response
+from chalice import Chalice, CognitoUserPoolAuthorizer, Cron, ForbiddenError, BadRequestError, Response
 
 from chalicelib.prefix_list_service import (
-    covers, diff_entries, get_all_entries, get_ec2_client, get_ip_info, get_prefix_list_id,
-    add_ip_to_prefix_list, remove_cidr_from_prefix_list, set_pin, sync_entries,
+    LIFETIME_DAYS, covers, diff_entries, get_all_entries, get_ec2_client, get_ip_info, get_prefix_list_id,
+    add_cidr_to_prefix_list, add_ip_to_prefix_list, remove_cidr_from_prefix_list, remove_expired,
+    set_pin, sync_entries, update_entry,
 )
 from chalicelib.sg_sync_service import list_managed_sgs, reconcile_sg_rules
 
@@ -29,6 +31,40 @@ COGNITO_USER_POOL_ARN = (
 authorizer = CognitoUserPoolAuthorizer(
     'PortGuardianAuth', provider_arns=[COGNITO_USER_POOL_ARN]
 )
+
+
+def _caller_groups():
+    """Cognito groups of the signed-in caller.
+
+    The REST API Cognito authorizer flattens the token's array claim into a string
+    ('admin', or '[admin, ops]' for several), so accept a list or any such string.
+    """
+    claims = ((app.current_request.context or {}).get('authorizer') or {}).get('claims') or {}
+    raw = claims.get('cognito:groups') or ''
+    if isinstance(raw, list):
+        return set(raw)
+    return {g for g in re.split(r'[\s,\[\]]+', raw) if g}
+
+
+def _can_write():
+    return os.environ['ADMIN_GROUP'] in _caller_groups()
+
+
+def _require_admin():
+    """Whitelist and SG changes are limited to the admin group; reads are open to any user."""
+    if not _can_write():
+        raise ForbiddenError(f"changes require membership of the '{os.environ['ADMIN_GROUP']}' group")
+
+
+def _lifetime(body):
+    """lifetime_days from a request body, validated; 0 means no expiry."""
+    try:
+        days = int(body.get('lifetime_days', 0))
+    except (TypeError, ValueError):
+        days = None
+    if days not in LIFETIME_DAYS:
+        raise BadRequestError(f'lifetime_days must be one of {list(LIFETIME_DAYS)}')
+    return days
 
 _HTML_TEMPLATE = None
 
@@ -271,6 +307,8 @@ def status():
         'list_count': len(readable),
         'primary': {'account': primary[0], 'region': primary[1], 'readable': primary_entries is not None},
         'drift': drift,
+        'can_write': _can_write(),
+        'lifetimes': list(LIFETIME_DAYS),
     }
 
 
@@ -280,8 +318,10 @@ def status():
 
 @app.route('/update', methods=['POST'], authorizer=authorizer)
 def update():
+    _require_admin()
     ip = _get_source_ip()
-    return {'ip': ip, 'results': _write_through(lambda ec2, pl_id: add_ip_to_prefix_list(ec2, pl_id, ip))}
+    days = _lifetime(app.current_request.json_body or {})
+    return {'ip': ip, 'results': _write_through(lambda ec2, pl_id: add_ip_to_prefix_list(ec2, pl_id, ip, days))}
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +331,8 @@ def update():
 @app.route('/sync-entries', methods=['POST'], authorizer=authorizer)
 def sync_entries_route():
     dry_run = bool((app.current_request.json_body or {}).get('dry_run'))
+    if not dry_run:
+        _require_admin()
     account_id, region = _primary_target()
     primary = {'account': account_id, 'region': region}
     try:
@@ -341,38 +383,80 @@ def sync_sg():
     body = app.current_request.json_body or {}
     allow_exit = bool(body.get('allow_exit'))
     dry_run = bool(body.get('dry_run'))
+    if not dry_run:
+        _require_admin()
     return {'targets': _fanout_sg(
         lambda ec2, pl_id: reconcile_sg_rules(ec2, pl_id, TAG_KEY, allow_exit=allow_exit, dry_run=dry_run)
     )}
 
 
 # ---------------------------------------------------------------------------
-# DELETE /entries — remove a CIDR on the primary, then sync replicas
+# /entries — add, edit, pin or delete one CIDR on the primary, then sync replicas
 # ---------------------------------------------------------------------------
+
+def _cidr_from(body):
+    cidr = (body.get('cidr') or '').strip()
+    if not cidr:
+        raise BadRequestError('cidr required')
+    return cidr
+
+
+@app.route('/entries', methods=['POST'], authorizer=authorizer)
+def add_entry():
+    """Add an arbitrary CIDR: {cidr, label, lifetime_days, pinned}."""
+    _require_admin()
+    body = app.current_request.json_body or {}
+    cidr, days, pinned = _cidr_from(body), _lifetime(body), bool(body.get('pinned'))
+    return {'cidr': cidr, 'results': _write_through(
+        lambda ec2, pl_id: add_cidr_to_prefix_list(ec2, pl_id, cidr, body.get('label', ''), days, pinned))}
+
 
 @app.route('/entries', methods=['DELETE'], authorizer=authorizer)
 def delete_entry():
-    body = app.current_request.json_body or {}
-    cidr = body.get('cidr', '').strip()
-    if not cidr:
-        return Response(body='{"error":"cidr required"}', status_code=400,
-                        headers={'Content-Type': 'application/json'})
+    _require_admin()
+    cidr = _cidr_from(app.current_request.json_body or {})
     # A CIDR only on replicas is 'absent' on the primary; the sync still removes it.
     return {'cidr': cidr, 'results': _write_through(
         lambda ec2, pl_id: remove_cidr_from_prefix_list(ec2, pl_id, cidr))}
 
 
-# ---------------------------------------------------------------------------
-# PATCH /entries — pin/unpin a CIDR on the primary, then sync replicas
-# ---------------------------------------------------------------------------
-
 @app.route('/entries', methods=['PATCH'], authorizer=authorizer)
 def patch_entry():
+    """{cidr, pinned} toggles the pin; {cidr, label?, expires?} edits the entry.
+
+    expires is a YYYY-MM-DD last valid day (UTC+8), or null for no expiry.
+    """
+    _require_admin()
     body = app.current_request.json_body or {}
-    cidr = body.get('cidr', '').strip()
-    pinned = bool(body.get('pinned'))
-    if not cidr:
-        return Response(body='{"error":"cidr required"}', status_code=400,
-                        headers={'Content-Type': 'application/json'})
-    return {'cidr': cidr, 'pinned': pinned, 'results': _write_through(
-        lambda ec2, pl_id: set_pin(ec2, pl_id, cidr, pinned))}
+    cidr = _cidr_from(body)
+    if 'pinned' in body:
+        pinned = bool(body['pinned'])
+        return {'cidr': cidr, 'pinned': pinned, 'results': _write_through(
+            lambda ec2, pl_id: set_pin(ec2, pl_id, cidr, pinned))}
+    changes = {}
+    if 'label' in body:
+        changes['label'] = body['label'] or ''
+    if 'expires' in body:
+        try:
+            changes['expires'] = date.fromisoformat(body['expires']) if body['expires'] else None
+        except (TypeError, ValueError):
+            raise BadRequestError('expires must be a YYYY-MM-DD date or null')
+    if not changes:
+        raise BadRequestError('nothing to change: send pinned, label or expires')
+    return {'cidr': cidr, 'results': _write_through(
+        lambda ec2, pl_id: update_entry(ec2, pl_id, cidr, **changes))}
+
+
+# ---------------------------------------------------------------------------
+# Daily expiry sweep
+# ---------------------------------------------------------------------------
+
+# 00:05 in EXPIRY_TZ (UTC+8): the first run of a new local day removes every entry
+# whose last valid day was yesterday. Runs as its own Lambda function.
+@app.schedule(Cron(5, 16, '*', '*', '?', '*'), name='sweep_expired')
+def sweep_expired(event):
+    results = _write_through(remove_expired)
+    for r in results:
+        level = app.log.error if str(r['status']).startswith(('error', 'skipped')) else app.log.info
+        level(f"sweep {r['account']}/{r['region']}: {r['status']}")
+    return results

@@ -4,11 +4,17 @@
 
 ### Added
 
-- Prefix lists that differ from the primary list are flagged in the UI, along with entries missing from some lists; **Review sync** previews the changes per list and warns if one would remove your current IP's access.
+- Prefix lists that differ from the primary list are flagged in the UI, along with entries missing from some lists; **Review sync** previews the changes per list, with each entry's description, and warns if one would remove your current IP's access.
+- Choose how long an entry lasts when adding it — never, or 1, 7, 30, 90 or 180 days — and set an exact expiry date when editing it. Expired entries are removed from every list each day at 00:05 (UTC+8). Entries that never expire are still retired by FIFO, or kept with a pin.
+- **+ Add entry** adds any public IPv4 CIDR (up to a /16) with a description, and each entry can be edited to change its description or expiry.
+- Entries added outside Port Guardian, such as through the AWS console, are tagged `external`; editing one in Port Guardian clears the tag.
 
 ### Changed
 
 - Whitelist writes land on one primary list (primary account, Lambda's region) and every other list is then made identical to it. A failed write can no longer leave the lists diverged, and each write repairs drift left by earlier ones. Entries added by hand to a non-primary list are removed on the next write.
+- Only members of the `cognito.admin_group` group (new, required in `config.yaml`) can change the whitelist or SG rules; other signed-in users get a read-only view.
+- Descriptions are shown without their internal markers: expiry and creation time have their own columns, and a pin shows as an icon.
+- Pinning an entry also clears its expiry.
 
 ### Fixed
 
