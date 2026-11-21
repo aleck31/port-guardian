@@ -61,7 +61,7 @@ class TestRdapCidr:
 
     def test_opaque_handle_falls_back_to_fixed_width(self):
         """No network in the handle — startAddress is deliberately unused (T-7.6)."""
-        assert _rdap_cidr(RDAP_OPAQUE_HANDLE, '52.76.50.151') == '52.76.50.0/24'
+        assert _rdap_cidr(RDAP_OPAQUE_HANDLE, '52.76.10.20') == '52.76.10.0/24'
 
     def test_cidr_handle(self):
         assert _rdap_cidr(RDAP_CIDR_HANDLE, '203.0.113.7') == '203.0.113.0/24'
@@ -77,7 +77,7 @@ class TestRdapCidr:
         (RDAP_MULTI_BLOCK, '101.78.129.1'),
         (RDAP_SINGLE_BLOCK, '61.244.10.20'),
         (RDAP_WIDER_THAN_CLAMP, '223.104.1.5'),
-        (RDAP_OPAQUE_HANDLE, '52.76.50.151'),
+        (RDAP_OPAQUE_HANDLE, '52.76.10.20'),
         (RDAP_CIDR_HANDLE, '203.0.113.7'),
         (None, '198.51.100.9'),
         ({'handle': 'garbage'}, '198.51.100.9'),
@@ -120,7 +120,7 @@ class TestCloudHostedIp:
         monkeypatch.setattr(
             'chalicelib.prefix_list_service._cloud_networks', lambda: self.AWS_RANGES
         )
-        assert _rdap_cidr(RDAP_OPAQUE_HANDLE, '52.76.50.151') == '52.76.50.151/32'
+        assert _rdap_cidr(RDAP_OPAQUE_HANDLE, '52.76.10.20') == '52.76.10.20/32'
 
     def test_non_cloud_ip_still_uses_the_rdap_allocation(self, monkeypatch):
         monkeypatch.setattr(
@@ -133,13 +133,13 @@ class TestCloudHostedIp:
         monkeypatch.setattr(
             'chalicelib.prefix_list_service._cloud_networks', lambda: None
         )
-        assert _rdap_cidr(RDAP_OPAQUE_HANDLE, '52.76.50.151') == '52.76.50.0/24'
+        assert _rdap_cidr(RDAP_OPAQUE_HANDLE, '52.76.10.20') == '52.76.10.0/24'
 
     def test_is_cloud_ip_reports_undetermined_as_none(self, monkeypatch):
         monkeypatch.setattr(
             'chalicelib.prefix_list_service._cloud_networks', lambda: None
         )
-        assert _is_cloud_ip('52.76.50.151') is None
+        assert _is_cloud_ip('52.76.10.20') is None
 
     def test_fetch_failure_is_undetermined_not_false(self, monkeypatch):
         """A failed fetch must not read as 'not cloud', which would widen the block."""

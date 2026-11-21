@@ -60,7 +60,7 @@ class TestLifetime:
 
 
 class TestManualAdd:
-    @pytest.mark.parametrize('text, expected', [('52.76.50.151', '52.76.50.151/32'), ('45.76.10.9/24', '45.76.10.0/24')])
+    @pytest.mark.parametrize('text, expected', [('52.76.10.20', '52.76.10.20/32'), ('45.76.10.9/24', '45.76.10.0/24')])
     def test_normalizes(self, text, expected):
         assert pls.normalize_cidr(text) == expected
 
