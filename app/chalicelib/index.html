@@ -481,7 +481,8 @@ function renderEntries(entries) {
     rows.sort((a, b) => !a.p.when - !b.p.when || _timeSortDir * a.p.when.localeCompare(b.p.when));
   }
   const arrow = _timeSortDir === -1 ? ' ▼' : _timeSortDir === 1 ? ' ▲' : '';
-  body.innerHTML = '<table style="width:100%"><thead><tr><th>CIDR</th>' +
+  // Scroll the table, not the page: CIDR + timestamp + label can't fit a phone width.
+  body.innerHTML = '<div style="overflow-x:auto"><table style="width:100%"><thead><tr><th>CIDR</th>' +
     '<th style="cursor:pointer;user-select:none" onclick="sortEntriesByTime()" title="Sort by time">Added At' + arrow + '</th>' +
     '<th>Description</th><th></th></tr></thead><tbody>' +
     rows.map(({ e, p }) =>
@@ -493,7 +494,7 @@ function renderEntries(entries) {
           '" onclick="togglePin(\'' + e.cidr + '\', ' + !p.pinned + ')">' + (p.pinned ? ICON_PIN_FILLED : ICON_PIN) + '</button>' +
         '<button class="btn-icon" style="color:#ef4444" title="Delete" onclick="deleteEntry(\'' + e.cidr + '\')">' + ICON_TRASH + '</button>' +
         '</td></tr>'
-    ).join('') + '</tbody></table>';
+    ).join('') + '</tbody></table></div>';
 }
 
 function showOverlay() { document.getElementById('overlay').style.display = 'flex'; }
