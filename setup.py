@@ -1,10 +1,13 @@
 """Port Guardian — deployment and infrastructure setup.
 
 Usage:
-  python setup.py              Deploy chalice app (syncs config.yaml → config.json)
+  python setup.py              Deploy chalice app (syncs config.yaml → config.json), set log
+                               retention, make the target role trust every Lambda role
   python setup.py --sync-sg    Deploy + sync SG ingress rules
   python setup.py --init       Deploy + IAM role + prefix lists + SG sync
   --profile NAME               AWS profile for the primary account (default: default creds)
+
+The secondary account is always reached through the local `lab` AWS profile.
 """
 
 import argparse

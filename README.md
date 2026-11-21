@@ -24,9 +24,10 @@ Port Guardian provides a web UI where authenticated users can view their current
 ## Architecture
 
 ```
-Browser → API Gateway + Cognito → Lambda → Prefix Lists (multi-accounts × multi-regions)
-                                                ↓
-                                        Security Groups (auto-synced)
+Browser → API Gateway + Cognito → Lambda ─┐
+                                          ├→ primary Prefix List → replica Prefix Lists (multi-accounts × multi-regions)
+EventBridge (daily) → sweep Lambda ───────┘                ↓
+                                                  Security Groups (referencing the lists)
 ```
 
 | Component | Technology |
@@ -36,6 +37,7 @@ Browser → API Gateway + Cognito → Lambda → Prefix Lists (multi-accounts ×
 | Auth | Cognito User Pool (USER_PASSWORD_AUTH, optional TOTP MFA) |
 | Network | AWS Managed Prefix Lists → Security Groups |
 | Cross-account | STS AssumeRole with credential caching |
+| Expiry | EventBridge schedule (00:05 UTC+8) → `sweep_expired` Lambda |
 
 ## Project Structure
 
@@ -44,11 +46,11 @@ Browser → API Gateway + Cognito → Lambda → Prefix Lists (multi-accounts ×
 ├── pyproject.toml          # Python dependencies and version
 ├── CHANGELOG.md            # Release notes
 ├── setup.py                # Deployment & SG sync script
-├── tests/                  # pytest suite (RDAP block selection, entry parsing)
+├── tests/                  # pytest suite with in-memory fakes; no AWS or network access
 └── app/
-    ├── app.py              # Lambda routes (parallel execution)
+    ├── app.py              # Routes, primary-list write-through, admin gate, daily expiry sweep
     ├── chalicelib/
-    │   ├── prefix_list_service.py  # EC2 client factory, prefix list ops, RDAP lookup
+    │   ├── prefix_list_service.py  # EC2 clients, RDAP lookup, entry format and lifetime, list writes and sync
     │   ├── sg_sync_service.py      # Tag-driven SG reconcile, shared by the Lambda and setup.py
     │   ├── index.html              # Single-page web UI
     │   └── pwa/                    # Manifest, service worker and icons
@@ -66,6 +68,8 @@ Browser → API Gateway + Cognito → Lambda → Prefix Lists (multi-accounts ×
 - Python 3.13+
 - AWS CLI configured
 - Cognito User Pool with an app client: no client secret, USER_PASSWORD_AUTH enabled. Users with TOTP MFA are prompted for a code; other challenges (SMS/email MFA, forced password change) are not handled by the UI
+- A Cognito group for the people allowed to make changes (`cognito.admin_group`)
+- A local AWS profile named `lab` for the secondary account: `setup.py` uses it for the cross-account IAM role, which every deploy checks
 
 ### Configuration
 
@@ -101,7 +105,7 @@ uv run setup.py --sync-sg --profile myprofile
 
 | Flag | What it does |
 |------|-------------|
-| (none) | Sync config + deploy Chalice app |
+| (none) | Sync config + deploy Chalice app, set log retention on every function, make the secondary account's role trust every Lambda role |
 | `--init` | + create IAM role, prefix lists, sync SG rules |
 | `--sync-sg` | + reconcile SG ingress rules to each SG's `port-guardian` tag |
 | `--profile NAME` | AWS profile for the primary account (default: default credentials) |
@@ -137,7 +141,7 @@ To use a custom domain instead of the default API Gateway URL:
 | DELETE | `/entries` | Admin | Remove a CIDR from the primary list, then sync the others |
 | PATCH | `/entries` | Admin | `{"cidr", "pinned"}` pins or unpins; `{"cidr", "label"?, "expires"?}` edits the description or sets the last valid day (`YYYY-MM-DD`, or `null` for never) |
 | POST | `/sync-entries` | Admin* | Make every list match the primary; `{"dry_run": true}` for a preview (*dry run open to any user) |
-| GET | `/sgs` | Yes | Overview of tagged Security Groups per account/region |
+| GET | `/sgs` | Yes | Every Security Group that uses the whitelist, per account/region, tagged or not |
 | POST | `/sync-sg` | Admin* | Reconcile SG ingress to each SG's `port-guardian` tag; `{"dry_run": true}` for a preview (*dry run open to any user), `{"allow_exit": true}` to also revoke rules on untagged SGs |
 
 "Yes" means any signed-in user; "Admin" means a member of `cognito.admin_group`.
@@ -146,7 +150,7 @@ To use a custom domain instead of the default API Gateway URL:
 
 - All endpoints except the page, `/ip` and the PWA assets require Cognito authentication; changes additionally require the admin group
 - Lambda IAM role follows least-privilege: `ec2:Describe*`/`ec2:Modify*` scoped to `ManagedBy=port-guardian`-tagged prefix lists; `AuthorizeSecurityGroupIngress` requires the `port-guardian` tag, `RevokeSecurityGroupIngress` does not (needed for the SG-sync exit path — see `.dev/AGENTS.md`)
-- Cross-account access via scoped AssumeRole
+- Cross-account access via scoped AssumeRole; each Lambda function has its own role, and the secondary account's role trusts exactly those
 - Management ports only open to prefix list IPs — no 0.0.0.0/0 rules
 - boto3 clients configured with short timeouts and no retries to fail fast
 - `/status` logs the caller's IP; the log group's retention comes from `lambda.log_retention_days`

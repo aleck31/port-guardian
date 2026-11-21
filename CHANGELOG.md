@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.6.0 — 2026-11-22
+
 ### Added
 
 - Prefix lists that differ from the primary list are flagged in the UI, along with entries missing from some lists; **Review sync** previews the changes per list, with each entry's description, and warns if one would remove your current IP's access.
